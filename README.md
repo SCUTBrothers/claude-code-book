@@ -15,7 +15,8 @@
 - `chapters/`: 正文章节
 - `appendix/`: 附录
 - `assets/`: 图片资源，包括封面
-- `build/`: 编译输出目录
+
+（生成的编译产物（如 `.aux`、`.log`、`.toc`、`main.pdf`）默认在仓库根目录）
 
 ## 环境要求
 
@@ -35,13 +36,13 @@ sudo apt install texlive-xetex texlive-lang-chinese latexmk
 在仓库根目录执行：
 
 ```bash
-latexmk -xelatex -interaction=nonstopmode -halt-on-error -output-directory=build main.tex
+latexmk -xelatex -interaction=nonstopmode -halt-on-error main.tex
 ```
 
 输出文件位于：
 
 ```text
-build/main.pdf
+./main.pdf
 ```
 
 ## 封面
