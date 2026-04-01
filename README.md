@@ -62,12 +62,19 @@ latexmk -xelatex -interaction=nonstopmode -halt-on-error main.tex
 ## AI 书稿生成方案（基于 claude-code 源码）
 
 本仓库配套提供了 `plan.md`（书稿生产方案）。
-如果你要复现本书的 AI 生成流程，请按以下方式使用：
+本项目采用“**计划驱动 + 周期复审**”流程：
 
-1. 以 `plan.md` 为主控文档，先执行 `第2节/第4节` 的目标定义与结构约束，
-2. 按 `第7节` 的任务流建立章节/小节任务，
-3. 每轮在本地文件体系中落盘输入与输出，再提交审查，
-4. 按 `第11-12节` 的标准流程走 `plan -> draft -> review -> tex -> compile`。
+- 先以 `plan.md` 作为主控方案（优先阅读第2节、第4节，确定边界与写作约束）；
+- 再用 Claude Code 的 `/loop`（任务循环模式，见 [scheduled tasks 文档](https://code.claude.com/docs/en/scheduled-tasks)）逐轮执行：**任务入队 -> 生成 -> 本地落盘 -> 审查 -> 标记归档**；
+- 任务流参照 `plan.md` 第7节、11-12节，按 `plan -> draft -> review -> tex -> compile` 逐步迭代。
+
+### 工具链约定（每轮任务后）
+
+为确保每轮质量，建议每完成一轮任务后立刻执行一次 review：
+
+1. 使用 OpenAI 的 `ai-codex` 与 `codex-plugin-cc`（Claude Code 插件）进行自动审查：
+   https://github.com/openai/codex-plugin-cc
+2. 仅当 review 结论可接受后，才进入下一轮的 `tex` 与编译步骤。
 
 可直接复用的系统提示词骨架（来自 `plan.md`）如下：
 
