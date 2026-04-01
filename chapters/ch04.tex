@@ -1,0 +1,162 @@
+% chapters/ch04.tex — 第4章
+\chapter{终端界面架构：Ink、组件树与交互模型}
+
+\section{自研 Ink 引擎：终端中的 React}
+
+Claude Code 的终端界面不是传统的字符串拼接输出，而是一个完整的 React 应用。\texttt{src/ink/} 目录包含约 50 个文件，实现了一个自研的终端渲染引擎——基于 Ink 框架的深度定制版本。
+
+\texttt{ink.tsx} 是渲染引擎的核心入口。从其 import 列表可以看到引擎的技术栈：React reconciler（\texttt{react-reconciler}）、Yoga 布局引擎（用于 flexbox 布局计算）、以及大量终端控制序列处理模块。
+
+引擎的工作原理是：React 组件树通过自定义 reconciler 转换为终端 DOM 节点，Yoga 计算布局位置，然后渲染为终端输出。每一帧的渲染流程包括：
+
+\begin{enumerate}
+  \item React reconciler 处理组件更新，生成 DOM 变更
+  \item Yoga 布局引擎计算每个节点的位置和尺寸
+  \item \texttt{render-node-to-output} 将节点树渲染为字符网格
+  \item \texttt{render-to-screen} 将字符网格转换为终端控制序列
+  \item 差量输出到终端（\texttt{writeDiffToTerminal}）
+\end{enumerate}
+
+引擎支持多种高级终端特性：alt-screen 模式、鼠标追踪（\texttt{ENABLE\_MOUSE\_TRACKING}）、Kitty 键盘协议（\texttt{ENABLE\_KITTY\_KEYBOARD}）、文本选择与复制、超链接、搜索高亮。这些特性通过终端控制序列（CSI、DEC、OSC）实现。
+
+\texttt{ink/} 目录的内部结构反映了渲染管线的各个阶段：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{模块} & \textbf{职责} \\
+\midrule
+\texttt{reconciler.ts} & 自定义 React reconciler，桥接 React 与终端 DOM \\
+\texttt{dom.ts} & 终端 DOM 节点定义与操作 \\
+\texttt{layout/} & Yoga 布局引擎集成（flexbox 计算） \\
+\texttt{render-node-to-output.ts} & 将 DOM 树渲染为字符网格 \\
+\texttt{render-to-screen.ts} & 将字符网格转换为终端输出 \\
+\texttt{screen.ts} & 屏幕缓冲区管理（CellWidth、CharPool、StylePool） \\
+\texttt{output.ts} & 输出管理 \\
+\texttt{optimizer.ts} & 输出优化——减少不必要的终端控制序列 \\
+\texttt{selection.ts} & 文本选择系统（选中、复制、URL 检测） \\
+\texttt{searchHighlight.ts} & 搜索高亮渲染 \\
+\texttt{terminal.ts} & 终端能力检测与差量写入 \\
+\texttt{parse-keypress.ts} & 按键事件解析 \\
+\texttt{focus.ts} & 焦点管理（FocusManager） \\
+\texttt{hit-test.ts} & 鼠标点击与悬停的命中测试 \\
+\bottomrule
+\end{tabularx}
+\caption{Ink 渲染引擎模块结构}
+\end{table}
+
+\texttt{screen.ts} 中的对象池设计值得注意：\texttt{CharPool}、\texttt{StylePool}、\texttt{HyperlinkPool} 通过对象复用减少 GC 压力。\texttt{migrateScreenPools()} 在屏幕尺寸变化时迁移池状态，避免重新分配。
+
+差量渲染是性能的关键——\texttt{writeDiffToTerminal()} 只输出两帧之间变化的部分，而不是每帧重绘整个屏幕。\texttt{optimizer.ts} 进一步减少输出中冗余的终端控制序列。
+
+帧率控制通过 \texttt{FRAME\_INTERVAL\_MS} 常量和 \texttt{throttle} 实现，避免过于频繁的终端刷新。
+
+\section{组件层次：从 App 到 REPL}
+
+组件树的顶层是 \texttt{src/components/App.tsx}，它是所有交互式会话的根包装器。App 组件提供三层 Context Provider：
+
+\begin{enumerate}
+  \item \texttt{FpsMetricsProvider}：帧率性能指标
+  \item \texttt{StatsProvider}：统计数据上下文
+  \item \texttt{AppStateProvider}：全局应用状态（消息、任务、配置等）
+\end{enumerate}
+
+App 组件使用了 React Compiler 的优化输出（\texttt{react/compiler-runtime}），通过缓存数组 \texttt{\$} 实现细粒度的 memoization，避免不必要的子树重渲染。
+
+图 \ref{fig:component-tree} 展示了组件树的核心层次。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  level distance=1.3cm,
+  sibling distance=3.5cm,
+  every node/.style={rectangle, draw, rounded corners, minimum width=2.2cm, minimum height=0.6cm, align=center, font=\small},
+  edge from parent/.style={draw, ->, thick},
+  level 1/.style={sibling distance=4cm},
+  level 2/.style={sibling distance=2.8cm},
+]
+  \node {Ink 渲染引擎}
+    child { node {App}
+      child { node {REPL}
+        child { node[font=\scriptsize] {PromptInput} }
+        child { node[font=\scriptsize] {MessageList} }
+        child { node[font=\scriptsize] {Permission\\Request} }
+      }
+      child { node {Doctor} }
+    };
+\end{tikzpicture}
+\caption{终端 UI 组件树核心层次}
+\label{fig:component-tree}
+\end{figure}
+
+App 之下是屏幕组件。\texttt{src/screens/} 目录包含三个屏幕：
+
+\begin{itemize}
+  \item \texttt{REPL.tsx}：主交互界面，是最核心的屏幕组件
+  \item \texttt{Doctor.tsx}：诊断界面
+  \item \texttt{ResumeConversation.tsx}：会话恢复界面
+\end{itemize}
+
+\texttt{REPL.tsx} 是整个终端界面中最复杂的组件，从其 60 余行的 import 列表可以看出它整合了几乎所有子系统：消息渲染、权限请求对话框、提示输入、命令队列、后台任务导航、搜索高亮、会话管理、团队协作等。
+
+\section{核心 UI 组件}
+
+\texttt{src/components/} 目录包含 140 余个组件文件，构成了 Claude Code 的完整 UI 组件库。按功能可以分为几类：
+
+\paragraph{输入与交互}
+
+\texttt{PromptInput/} 是用户输入组件，\texttt{BaseTextInput.tsx} 提供基础文本输入能力。\texttt{CustomSelect/} 实现自定义选择菜单。
+
+\paragraph{权限与对话框}
+
+\texttt{permissions/} 子目录包含权限请求相关组件，如 \texttt{PermissionRequest.tsx}（权限确认对话框）和 \texttt{WorkerPendingPermission.tsx}（worker 等待权限状态）。\texttt{AutoModeOptInDialog.tsx}、\texttt{BypassPermissionsModeDialog.tsx} 等处理不同权限模式的切换。
+
+\paragraph{消息与内容展示}
+
+\texttt{CompactSummary.tsx} 展示压缩摘要，\texttt{diff/} 子目录处理代码差异展示，\texttt{ContextVisualization.tsx} 可视化上下文状态。
+
+\paragraph{状态与反馈}
+
+\texttt{AgentProgressLine.tsx} 展示代理执行进度，\texttt{CostThresholdDialog.tsx} 处理费用阈值提醒，\texttt{DiagnosticsDisplay.tsx} 展示诊断信息。
+
+\paragraph{设计系统}
+
+\texttt{design-system/} 子目录包含基础 UI 原语，为上层组件提供统一的视觉风格。
+
+\section{键绑定系统}
+
+\texttt{src/keybindings/} 目录实现了一套完整的键绑定系统，包含 14 个文件。
+
+\texttt{defaultBindings.ts} 定义默认快捷键映射，\texttt{loadUserBindings.ts} 加载用户自定义绑定（从 \texttt{\~{}/.claude/keybindings.json}），\texttt{resolver.ts} 负责将按键事件解析为对应的操作。
+
+键绑定系统支持：
+
+\begin{itemize}
+  \item 单键快捷键和组合键（chord）
+  \item 用户自定义覆盖默认绑定
+  \item 保留快捷键保护（\texttt{reservedShortcuts.ts}）
+  \item 上下文感知的快捷键激活（不同模式下同一按键触发不同操作）
+  \item 快捷键提示显示（\texttt{useShortcutDisplay.ts}）
+\end{itemize}
+
+\texttt{useKeybinding.ts} 是组件中使用键绑定的 hook，它将键盘事件与注册的绑定进行匹配，触发对应的回调。\texttt{schema.ts} 和 \texttt{validate.ts} 确保用户自定义绑定的格式正确。
+
+\section{交互模型：事件流与状态管理}
+
+Claude Code 的交互模型建立在 React 的单向数据流之上。\texttt{AppState} 是全局状态对象，通过 \texttt{AppStateProvider} 注入组件树。状态更新通过 \texttt{setAppState} 函数式更新，触发组件重渲染。
+
+用户输入事件的处理流程：
+
+\begin{enumerate}
+  \item 终端原始按键事件被 Ink 引擎捕获
+  \item \texttt{parse-keypress.ts} 解析为结构化的 \texttt{ParsedKey}
+  \item 键绑定系统匹配快捷键
+  \item 若匹配到命令，执行对应操作
+  \item 若为文本输入，传递给 \texttt{PromptInput} 组件
+  \item 用户提交输入后，进入 QueryEngine 的查询流程
+\end{enumerate}
+
+Ink 引擎还支持鼠标事件（点击、悬停）和终端焦点事件（\texttt{useTerminalFocus}），使得终端界面具备了接近 GUI 的交互能力。
+
+这套架构的工程权衡在于：React 的声明式编程模型大幅降低了复杂 UI 的维护成本，但引入了 reconciler、Yoga 布局等运行时开销。对于一个 CLI 工具来说，这是一个不寻常的选择——它意味着 Claude Code 的终端界面本质上是一个运行在终端中的 React 应用。

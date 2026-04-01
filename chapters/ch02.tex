@@ -1,0 +1,182 @@
+% chapters/ch02.tex — 第2章
+\chapter{入口、REPL 与 Query 生命周期}
+
+\section{CLI 入口：多路快速分发}
+
+Claude Code 的执行从 \texttt{src/entrypoints/cli.tsx} 开始。这个文件的核心设计是一个多路分发器：根据命令行参数，将请求路由到不同的快速路径（fast path），只有在没有匹配到任何快速路径时，才加载完整的 CLI 主模块。
+
+这种设计的工程目的是最小化启动开销。\texttt{cli.tsx} 中所有模块导入都是动态的（\texttt{await import(...)}），源码注释写道：``All imports are dynamic to minimize module evaluation for fast paths. Fast-path for -{}-version has zero imports beyond this file.''
+
+快速路径按优先级排列：
+
+\begin{enumerate}
+  \item \texttt{-{}-version} / \texttt{-v}：直接输出 \texttt{MACRO.VERSION}，零模块加载
+  \item \texttt{-{}-dump-system-prompt}：输出系统提示词（内部功能，feature flag 门控）
+  \item \texttt{-{}-claude-in-chrome-mcp}：启动 Chrome MCP 服务器
+  \item \texttt{-{}-chrome-native-host}：启动 Chrome Native Host
+  \item \texttt{-{}-daemon-worker}：启动守护进程 worker（feature flag 门控）
+  \item \texttt{remote-control} / \texttt{bridge}：启动 Bridge 模式（feature flag 门控）
+  \item \texttt{daemon}：启动守护进程主进程（feature flag 门控）
+  \item \texttt{ps} / \texttt{logs} / \texttt{attach} / \texttt{kill} / \texttt{-{}-bg}：后台会话管理（feature flag 门控）
+  \item \texttt{new} / \texttt{list} / \texttt{reply}：模板任务命令（feature flag 门控）
+  \item \texttt{-{}-worktree -{}-tmux}：tmux worktree 快速路径
+\end{enumerate}
+
+如果没有匹配到任何快速路径，\texttt{cli.tsx} 执行三步操作：启动早期输入捕获（\texttt{startCapturingEarlyInput}）、动态导入 \texttt{main.tsx}、调用 \texttt{cliMain()}。
+
+图 \ref{fig:cli-dispatch} 展示了入口分发的整体结构。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=4cm, minimum height=0.65cm, align=center, font=\small},
+  fast/.style={rectangle, draw, rounded corners, minimum width=4cm, minimum height=0.65cm, align=center, font=\small, fill=codebg},
+  arrow/.style={->, thick},
+]
+  \node[box] (entry) {cli.tsx 入口};
+  \node[box, below=of entry] (args) {解析 process.argv};
+  \node[fast, below left=1cm and 1.5cm of args] (version) {-{}-version\\零模块加载};
+  \node[fast, below=of args] (chrome) {Chrome MCP/\\Native Host};
+  \node[fast, below right=1cm and 1.5cm of args] (gated) {feature flag\\门控路径};
+  \node[box, below=2.5cm of args] (main) {动态 import main.tsx};
+  \node[box, below=of main] (repl) {cliMain() $\rightarrow$ REPL};
+
+  \draw[arrow] (entry) -- (args);
+  \draw[arrow] (args) -- node[above left, font=\scriptsize] {-v} (version);
+  \draw[arrow] (args) -- (chrome);
+  \draw[arrow] (args) -- node[above right, font=\scriptsize] {daemon/bridge/bg} (gated);
+  \draw[arrow] (args) -- node[right, font=\scriptsize] {无匹配} (main);
+  \draw[arrow] (main) -- (repl);
+\end{tikzpicture}
+\caption{CLI 入口多路分发}
+\label{fig:cli-dispatch}
+\end{figure}
+
+多数快速路径被 feature flag 门控。在外部构建中，\texttt{DAEMON}、\texttt{BRIDGE\_MODE}、\texttt{BG\_SESSIONS}、\texttt{TEMPLATES} 等开关均为 \texttt{false}，这些代码路径在编译时被完全消除。外部用户实际可用的快速路径只有 \texttt{-{}-version}、Chrome 相关路径和 worktree 路径。
+
+\section{初始化：init() 的职责链}
+
+当进入完整 CLI 路径后，\texttt{main.tsx} 被加载。在 REPL 启动之前，系统需要完成一系列初始化工作，这些工作集中在 \texttt{src/entrypoints/init.ts} 的 \texttt{init()} 函数中。
+
+\texttt{init()} 使用 \texttt{memoize} 包装，确保只执行一次。它的职责链按顺序包括：
+
+\begin{enumerate}
+  \item 启用配置系统（\texttt{enableConfigs()}）
+  \item 应用安全环境变量（\texttt{applySafeConfigEnvironmentVariables()}）
+  \item 配置 CA 证书——必须在首次 TLS 握手前完成
+  \item 设置优雅退出处理（\texttt{setupGracefulShutdown()}）
+  \item 异步初始化分析事件日志
+  \item 异步填充 OAuth 账户信息
+  \item 异步检测 JetBrains IDE 环境
+  \item 异步检测 Git 仓库
+  \item 初始化远程管理设置和策略限制的加载
+  \item 配置 mTLS 和全局 HTTP 代理
+  \item 预连接 Anthropic API（TCP+TLS 握手预热）
+\end{enumerate}
+
+这个初始化序列的设计体现了两个原则：关键路径同步执行（CA 证书、代理配置必须在网络请求前完成），非关键路径异步并行（OAuth、IDE 检测、仓库检测用 \texttt{void} 触发后不等待）。
+
+\texttt{main.tsx} 本身在模块顶层也执行了三个副作用操作，且必须在其他 import 之前运行：
+
+\begin{enumerate}
+  \item \texttt{profileCheckpoint('main\_tsx\_entry')}：标记启动时间点
+  \item \texttt{startMdmRawRead()}：启动 MDM 子进程读取，与后续 import 并行
+  \item \texttt{startKeychainPrefetch()}：预取 macOS 钥匙串中的 OAuth 和 API key
+\end{enumerate}
+
+源码注释解释了原因：钥匙串预取将两次串行的 macOS keychain 读取变为并行，节省约 65ms 的启动时间。这是一个典型的启动性能优化：把串行 I/O 变成并行。
+
+\section{main() 函数：Commander 解析与 REPL 启动}
+
+\texttt{main.tsx} 导出的 \texttt{main()} 函数是完整 CLI 的入口。它使用 Commander.js 定义命令行参数，处理认证、配置加载、工具注册等准备工作，最终启动 REPL 或执行单次查询。
+
+\texttt{main.tsx} 的 import 列表揭示了系统的核心依赖关系：Commander（CLI 解析）、React（UI 渲染）、chalk（终端着色）、以及大量内部模块——从 \texttt{context.js}（上下文管理）到 \texttt{tools.js}（工具注册）到 \texttt{replLauncher.js}（REPL 启动）。
+
+Commander 解析完成后，系统进入 REPL 循环或单次查询模式。REPL 通过 \texttt{launchRepl()} 启动，这是一个基于 Ink 的 React 应用。
+
+\section{QueryEngine：查询生命周期的核心}
+
+\texttt{QueryEngine} 是管理查询生命周期和会话状态的核心类。源码注释明确定义了它的职责：``QueryEngine owns the query lifecycle and session state for a conversation.''
+
+\texttt{QueryEngineConfig} 类型定义了创建 QueryEngine 所需的完整配置：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{配置项} & \textbf{用途} \\
+\midrule
+\texttt{cwd} & 工作目录 \\
+\texttt{tools} & 可用工具集合 \\
+\texttt{commands} & 斜杠命令列表 \\
+\texttt{mcpClients} & MCP 服务器连接 \\
+\texttt{agents} & 代理定义 \\
+\texttt{canUseTool} & 权限检查函数 \\
+\texttt{getAppState / setAppState} & 全局状态访问 \\
+\texttt{readFileCache} & 文件状态缓存 \\
+\texttt{maxTurns} & 最大轮次限制 \\
+\texttt{maxBudgetUsd} & 预算限制 \\
+\texttt{thinkingConfig} & 思考模式配置 \\
+\bottomrule
+\end{tabularx}
+\caption{QueryEngineConfig 核心配置项}
+\end{table}
+
+QueryEngine 的内部状态包括可变消息历史（\texttt{mutableMessages}）、中断控制器（\texttt{abortController}）、权限拒绝记录（\texttt{permissionDenials}）、累计 token 使用量（\texttt{totalUsage}）和文件状态缓存（\texttt{readFileState}）。
+
+设计上，一个 QueryEngine 实例对应一个会话。每次 \texttt{submitMessage()} 调用开始一个新的对话轮次，状态跨轮次持久化。
+
+\subsection{submitMessage 执行流}
+
+\texttt{submitMessage()} 是一个 \texttt{AsyncGenerator}，通过 \texttt{yield} 逐步返回 SDK 消息事件。它的执行流程包括：
+
+\begin{enumerate}
+  \item 解构配置——从 \texttt{QueryEngineConfig} 中提取工具、命令、MCP 客户端等
+  \item 包装权限检查——将 \texttt{canUseTool} 包装为 \texttt{wrappedCanUseTool}，在原始检查基础上追踪权限拒绝记录（\texttt{permissionDenials}）
+  \item 确定模型——优先使用用户指定模型（\texttt{userSpecifiedModel}），否则使用默认模型
+  \item 配置思考模式——默认启用 adaptive thinking，除非显式禁用
+  \item 组装系统提示词——通过 \texttt{fetchSystemPromptParts()} 获取默认提示词、用户上下文和系统上下文，然后按优先级合并：自定义提示词 > 默认提示词，再追加记忆机制提示词和附加提示词
+  \item 处理用户输入——通过 \texttt{processUserInput()} 解析斜杠命令、处理附件
+  \item 调用 \texttt{query()} 执行实际的 API 交互循环
+\end{enumerate}
+
+系统提示词的组装逻辑值得注意：当 SDK 调用方提供了 \texttt{customSystemPrompt} 时，它完全替换默认提示词（而非追加）。但如果同时设置了 \texttt{CLAUDE\_COWORK\_MEMORY\_PATH\_OVERRIDE} 环境变量，记忆机制提示词仍会被注入——这确保了自定义提示词的调用方仍然可以使用记忆系统。
+
+\section{query()：单次查询的执行流}
+
+\texttt{src/query.ts} 中的 \texttt{query()} 函数实现了单次查询的完整执行流。它的核心依赖包括工具查找与执行（\texttt{Tool.ts}）、自动压缩（\texttt{services/compact/}）、API 调用与错误处理（\texttt{services/api/}）、消息创建与规范化（\texttt{utils/messages.ts}）、以及记忆附件处理（\texttt{utils/attachments.ts}）。
+
+\texttt{query.ts} 开头的条件导入展示了 feature flag 在运行时的实际效果：
+
+\begin{lstlisting}[language=TypeScript]
+const reactiveCompact = feature('REACTIVE_COMPACT')
+  ? require('./services/compact/reactiveCompact.js')
+  : null
+const contextCollapse = feature('CONTEXT_COLLAPSE')
+  ? require('./services/contextCollapse/index.js')
+  : null
+\end{lstlisting}
+
+这些模块只在对应 feature flag 启用时才被加载，否则为 \texttt{null}。调用方在使用前需要检查是否为空，这种模式贯穿整个代码库。
+
+\section{Task 系统：后台任务管理}
+
+\texttt{src/Task.ts} 定义了 Claude Code 的任务类型系统。任务是后台运行的工作单元，支持多种类型：
+
+\begin{lstlisting}[language=TypeScript]
+type TaskType =
+  | 'local_bash'          // 本地 shell 命令
+  | 'local_agent'         // 本地子代理
+  | 'remote_agent'        // 远程代理
+  | 'in_process_teammate' // 进程内团队成员
+  | 'local_workflow'      // 本地工作流
+  | 'monitor_mcp'         // MCP 监控
+  | 'dream'               // 梦境模式
+\end{lstlisting}
+
+任务状态机定义了五个状态：\texttt{pending}、\texttt{running}、\texttt{completed}、\texttt{failed}、\texttt{killed}。\texttt{isTerminalTaskStatus()} 函数判断任务是否处于终态（completed/failed/killed），用于防止向已结束的任务注入消息、清理孤儿任务等场景。
+
+\texttt{TaskContext} 提供了任务执行所需的环境：\texttt{abortController}（中断控制）、\texttt{getAppState}（状态读取）、\texttt{setAppState}（状态写入）。这个设计使得每个任务都能访问和修改全局应用状态，同时通过 AbortController 支持外部取消。
+
+任务 ID 使用类型前缀区分：\texttt{b} 代表 \texttt{local\_bash}，其他类型有各自的前缀。这种命名约定使得从 ID 就能判断任务类型，便于日志分析和调试。

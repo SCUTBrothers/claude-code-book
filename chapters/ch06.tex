@@ -1,0 +1,151 @@
+% chapters/ch06.tex — 第6章
+\chapter{Agent Runtime：任务、子代理、协作与远程执行}
+
+\section{任务系统回顾：从类型到实例}
+
+第 2 章介绍了 \texttt{Task.ts} 中的任务类型定义。本章深入到任务的实际实现。\texttt{src/tasks/} 目录包含多个任务类型的具体实现，每种类型对应一个子目录：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{目录} & \textbf{用途} \\
+\midrule
+\texttt{LocalShellTask/} & 本地 shell 命令的后台执行 \\
+\texttt{LocalAgentTask/} & 本地子代理——在独立上下文中运行的 Claude 实例 \\
+\texttt{InProcessTeammateTask/} & 进程内团队成员——与主代理共享进程的协作代理 \\
+\texttt{RemoteAgentTask/} & 远程代理——通过网络连接的 Claude 实例 \\
+\texttt{DreamTask/} & 梦境任务——后台异步处理（内部功能） \\
+\texttt{LocalMainSessionTask.ts} & 本地主会话任务管理 \\
+\bottomrule
+\end{tabularx}
+\caption{任务类型实现目录}
+\end{table}
+
+\texttt{stopTask.ts} 提供统一的任务停止接口，\texttt{pillLabel.ts} 处理任务在 UI 中的标签显示，\texttt{types.ts} 定义任务间共享的类型。
+
+\section{LocalShellTask：后台命令执行}
+
+\texttt{LocalShellTask/} 实现了后台 shell 命令的执行与监控。它是最基础的任务类型，由 \texttt{BashTool} 在需要后台执行时创建。
+
+\texttt{LocalShellTask.tsx} 的实现包含一个值得注意的机制：stall 检测。当后台命令的输出停止增长超过 45 秒（\texttt{STALL\_THRESHOLD\_MS}），且输出末尾看起来像交互式提示（如 \texttt{(y/n)}、\texttt{Press Enter}、\texttt{Continue?}），系统会发送通知提醒用户命令可能在等待输入。
+
+\begin{lstlisting}[language=TypeScript]
+const STALL_CHECK_INTERVAL_MS = 5_000;
+const STALL_THRESHOLD_MS = 45_000;
+const STALL_TAIL_BYTES = 1024;
+\end{lstlisting}
+
+\texttt{looksLikePrompt()} 函数通过正则表达式匹配输出末尾的模式来判断命令是否在等待输入。这个设计区分了"命令执行慢"（如长时间编译）和"命令在等待交互"两种情况，只对后者发出通知。
+
+\texttt{guards.ts} 定义了 \texttt{LocalShellTaskState} 类型和类型守卫函数，\texttt{killShellTasks.ts} 实现了 shell 任务的终止逻辑——需要正确处理子进程树的清理。
+
+\section{LocalAgentTask：子代理执行}
+
+\texttt{LocalAgentTask/} 实现了本地子代理——由 \texttt{AgentTool} 派生的独立 Claude 实例。每个子代理有自己的上下文、消息历史和工具集合，但共享主代理的权限配置。
+
+\texttt{LocalAgentTask.tsx} 中定义了完整的进度追踪系统：
+
+\begin{lstlisting}[language=TypeScript]
+type AgentProgress = {
+  toolUseCount: number;
+  tokenCount: number;
+  lastActivity?: ToolActivity;
+  recentActivities?: ToolActivity[];
+  summary?: string;
+};
+\end{lstlisting}
+
+\texttt{ProgressTracker} 分别追踪输入和输出 token，避免重复计数——Claude API 的 \texttt{input\_tokens} 是每轮累计值（包含所有历史上下文），而 \texttt{output\_tokens} 是每轮增量值，两者的计数方式不同。
+
+\texttt{ToolActivity} 记录子代理最近的工具调用活动，包括工具名称、输入参数和预计算的活动描述（如"Reading src/foo.ts"）。\texttt{MAX\_RECENT\_ACTIVITIES}（5 条）限制了活动历史的长度，避免内存膨胀。
+
+\texttt{ActivityDescriptionResolver} 类型允许在记录时预计算活动描述，而不是在渲染时计算——这是一个性能优化，避免在 UI 渲染路径上执行工具描述解析。
+
+子代理的输出通过磁盘文件中转（\texttt{getTaskOutputPath()}），而不是内存缓冲。\texttt{initTaskOutputAsSymlink()} 将输出文件链接到会话存储目录，使得子代理的完整对话记录可以在会话结束后保留。
+
+子代理与主代理之间的通信通过 \texttt{AppState} 中的任务状态实现。主代理通过 \texttt{registerTask()} 注册子代理任务，通过 \texttt{updateTaskState()} 更新进度信息。子代理完成后，通过 \texttt{enqueuePendingNotification()} 向主代理的消息队列注入完成通知——这个通知会在主代理的下一轮 query 循环中被处理。
+
+\texttt{killShellTasksForAgent()} 在子代理终止时清理其创建的所有后台 shell 任务，防止孤儿进程。\texttt{cleanupAgentTracking()} 清理 API 调用追踪状态。\texttt{createChildAbortController()} 确保父代理中断时子代理也被中断。
+
+子代理还支持 worktree 隔离——\texttt{LocalAgentTask.tsx} 中引用了 \texttt{WORKTREE\_PATH\_TAG} 和 \texttt{WORKTREE\_BRANCH\_TAG}，表明子代理可以在独立的 git worktree 中运行，避免与主代理的文件操作冲突。
+
+\section{Companion 系统：虚拟伙伴}
+
+\texttt{src/buddy/} 目录实现的并非传统意义上的子代理系统，而是一个虚拟伙伴（Companion）机制。\texttt{companion.ts} 使用确定性伪随机数生成器（Mulberry32 PRNG）基于用户身份生成一个虚拟角色，具有物种、稀有度、属性值等特征。
+
+\texttt{prompt.ts} 中的 \texttt{companionIntroText()} 函数揭示了 Companion 的实际定位：它是一个"坐在用户输入框旁边的小动物"，偶尔在气泡中发表评论。当用户直接称呼 Companion 的名字时，气泡会回应。
+
+Companion 系统通过 \texttt{BUDDY} feature flag 门控，在外部版本中关闭。它是一个趣味性功能，不参与实际的代码执行或任务处理。
+
+真正的子代理能力由 \texttt{AgentTool}（\texttt{src/tools/AgentTool/}）提供，它在外部版本中可用，是用户通过工具调用派生子代理的标准方式。AgentTool 创建的子代理对应 \texttt{LocalAgentTask} 类型。
+
+\section{团队协作：InProcessTeammate}
+
+\texttt{InProcessTeammateTask/} 实现了进程内团队协作。源码注释明确了它与 LocalAgentTask 的区别：
+
+\begin{enumerate}
+  \item 在同一个 Node.js 进程中运行，使用 \texttt{AsyncLocalStorage} 实现隔离
+  \item 具有团队感知的身份标识（\texttt{agentName@teamName}）
+  \item 支持计划模式审批流程
+  \item 可以处于空闲状态（等待工作）或活跃状态（处理中）
+\end{enumerate}
+
+消息注入机制是团队协作的核心。\texttt{injectUserMessageToTeammate()} 函数将消息放入团队成员的 \texttt{pendingUserMessages} 队列，同时追加到 \texttt{messages} 列表以便立即在 UI 中显示。消息注入允许在 \texttt{running} 和空闲状态下进行，只有终态（completed/failed/killed）才会拒绝。
+
+\texttt{requestTeammateShutdown()} 通过设置 \texttt{shutdownRequested} 标志请求团队成员优雅退出，而不是直接终止。\texttt{appendTeammateMessage()} 将消息追加到团队成员的对话历史，使用 \texttt{appendCappedMessage()} 限制历史长度。
+
+团队记忆同步由 \texttt{src/services/teamMemorySync/} 处理：
+
+\begin{itemize}
+  \item \texttt{watcher.ts}：文件系统监听，检测记忆文件变更
+  \item \texttt{secretScanner.ts}：扫描记忆内容中的敏感信息
+  \item \texttt{teamMemSecretGuard.ts}：防止 API key、密码等通过团队记忆泄露
+\end{itemize}
+
+安全扫描是团队记忆同步的关键环节——多代理共享记忆时，必须防止敏感信息跨代理传播。
+
+\section{远程执行：Remote 模块}
+
+\texttt{src/remote/} 目录实现了远程代理执行能力，包含 4 个文件：
+
+\texttt{RemoteSessionManager.ts} 管理远程会话的生命周期——创建、连接、断开、重连。\texttt{SessionsWebSocket.ts} 实现了与远程 Claude 实例的 WebSocket 通信。
+
+\texttt{sdkMessageAdapter.ts} 负责消息格式转换，将本地消息格式适配为远程 SDK 期望的格式。\texttt{remotePermissionBridge.ts} 处理远程执行中的权限同步——当远程代理需要执行敏感操作时，权限请求需要传回本地由用户确认。
+
+远程执行的典型场景是 Claude Code Remote（CCR）：用户在本地终端操作，但实际的代码执行发生在远程容器中。这需要解决权限同步、文件系统映射、网络代理等一系列工程问题。
+
+\section{任务生命周期管理}
+
+所有任务类型共享相同的生命周期。图 \ref{fig:task-state-machine} 展示了任务状态机。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=2cm,
+  state/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.7cm, align=center, font=\small},
+  terminal/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.7cm, align=center, font=\small, fill=codebg},
+  arrow/.style={->, thick},
+]
+  \node[state] (pending) {pending};
+  \node[state, right=of pending] (running) {running};
+  \node[terminal, above right=0.8cm and 2cm of running] (completed) {completed};
+  \node[terminal, right=2.5cm of running] (failed) {failed};
+  \node[terminal, below right=0.8cm and 2cm of running] (killed) {killed};
+
+  \draw[arrow] (pending) -- node[above, font=\scriptsize] {启动} (running);
+  \draw[arrow] (running) -- node[above left, font=\scriptsize] {成功} (completed);
+  \draw[arrow] (running) -- node[above, font=\scriptsize] {错误} (failed);
+  \draw[arrow] (running) -- node[below left, font=\scriptsize] {abort()} (killed);
+\end{tikzpicture}
+\caption{任务状态机：pending $\rightarrow$ running $\rightarrow$ completed/failed/killed}
+\label{fig:task-state-machine}
+\end{figure}
+
+\texttt{AppState} 中维护了所有活跃任务的列表，UI 组件通过订阅状态变更来更新任务显示。\texttt{isTerminalTaskStatus()} 判断 completed、failed、killed 三个终态，用于防止向已结束的任务注入消息和触发资源清理。
+
+任务的取消通过 \texttt{AbortController} 实现。每个任务在创建时获得一个 \texttt{abortController}，外部可以通过调用 \texttt{abort()} 来请求取消。任务实现需要检查 \texttt{abortController.signal} 来响应取消请求。子代理任务还支持 \texttt{createChildAbortController()}，创建与父级联动的中断控制器——父级中断时子级自动中断。
+
+\texttt{stopTask.ts} 提供了统一的停止接口，它根据任务类型分发到对应的 \texttt{kill()} 实现。不同类型的任务有不同的清理逻辑——shell 任务需要终止子进程树，代理任务需要中断 API 调用并清理输出文件，团队成员任务通过 \texttt{killInProcessTeammate()} 处理。
+
+任务状态更新通过 \texttt{updateTaskState()} 函数统一管理，它接受一个类型安全的更新函数，确保状态转换的原子性。\texttt{registerTask()} 在 \texttt{AppState} 中注册新任务，\texttt{registerCleanup()} 确保进程退出时所有任务资源被正确清理。

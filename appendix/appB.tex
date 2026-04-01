@@ -1,0 +1,93 @@
+% appendix/appB.tex — 附录B：源码目录索引
+\chapter{源码目录索引}
+
+以下索引基于 Claude Code 2.1.88 版本的 \texttt{src/} 目录结构。
+
+\section*{顶层文件}
+
+{\small
+\begin{longtable}{lp{9cm}}
+\toprule
+\textbf{文件} & \textbf{用途} \\
+\midrule
+\endhead
+\texttt{main.tsx} & 主 REPL 逻辑，Commander 参数解析与会话启动 \\
+\texttt{Tool.ts} & 工具类型系统定义（接口，不含实现） \\
+\texttt{tools.ts} & 工具实例注册与组装 \\
+\texttt{Task.ts} & 任务类型与状态机定义 \\
+\texttt{tasks.ts} & 任务系统入口 \\
+\texttt{QueryEngine.ts} & 查询引擎——会话生命周期管理 \\
+\texttt{query.ts} & 单次查询执行流 \\
+\texttt{commands.ts} & 斜杠命令注册中心 \\
+\texttt{context.ts} & 系统/用户上下文组装 \\
+\texttt{cost-tracker.ts} & 费用追踪 \\
+\texttt{history.ts} & 会话历史管理 \\
+\texttt{ink.ts} & Ink 渲染引擎导出 \\
+\bottomrule
+\end{longtable}
+}
+
+\section*{核心目录}
+
+{\small
+\begin{longtable}{llp{6.5cm}}
+\toprule
+\textbf{目录} & \textbf{章节} & \textbf{用途} \\
+\midrule
+\endhead
+\texttt{entrypoints/} & 第2章 & CLI 入口点与初始化 \\
+\texttt{tools/} & 第3章 & 40+ 工具实现 \\
+\texttt{commands/} & 第3章 & 40+ 斜杠命令实现 \\
+\texttt{hooks/} & 第3章 & 80+ React hook \\
+\texttt{ink/} & 第4章 & 自研终端渲染引擎 \\
+\texttt{components/} & 第4章 & 140+ 终端 UI 组件 \\
+\texttt{screens/} & 第4章 & 屏幕组件 \\
+\texttt{keybindings/} & 第4章 & 键绑定系统 \\
+\texttt{context/} & 第5章 & React Context 定义 \\
+\texttt{memdir/} & 第5章 & 记忆目录系统 \\
+\texttt{buddy/} & 第6章 & Companion 虚拟伙伴 \\
+\texttt{tasks/} & 第6章 & 任务类型实现 \\
+\texttt{remote/} & 第6章 & 远程代理执行 \\
+\texttt{skills/} & 第7章 & 技能系统 \\
+\texttt{plugins/} & 第7章 & 插件系统 \\
+\texttt{bridge/} & 第7章 & IDE 桥接层（内部） \\
+\texttt{moreright/} & 第8章 & 权限提升 UI \\
+\texttt{state/} & 第2章 & 全局状态管理 \\
+\texttt{types/} & 全书 & 共享类型定义 \\
+\texttt{utils/} & 全书 & 工具函数（564文件） \\
+\texttt{constants/} & 全书 & 全局常量 \\
+\texttt{migrations/} & 第9章 & 数据迁移 \\
+\texttt{vim/} & 第4章 & Vim 模式支持 \\
+\texttt{voice/} & 第9章 & 语音输入 \\
+\bottomrule
+\end{longtable}
+}
+
+\section*{services/ 子目录}
+
+{\small
+\begin{longtable}{llp{6.5cm}}
+\toprule
+\textbf{目录} & \textbf{章节} & \textbf{用途} \\
+\midrule
+\endhead
+\texttt{services/api/} & 第9章 & API 调用、错误处理、重试 \\
+\texttt{services/analytics/} & 第9章 & 分析埋点、GrowthBook \\
+\texttt{services/compact/} & 第5章 & 上下文压缩 \\
+\texttt{services/mcp/} & 第7章 & MCP 协议集成 \\
+\texttt{services/oauth/} & 第8章 & OAuth 认证流程 \\
+\texttt{services/policyLimits/} & 第8章 & 组织策略限制 \\
+\texttt{services/SessionMemory/} & 第5章 & 会话记忆管理 \\
+\texttt{services/extractMemories/} & 第5章 & 自动记忆提取 \\
+\texttt{services/teamMemorySync/} & 第6章 & 团队记忆同步 \\
+\texttt{services/tools/} & 第3章 & 工具服务层 \\
+\texttt{services/lsp/} & 第3章 & LSP 服务器管理 \\
+\texttt{services/plugins/} & 第7章 & 插件服务 \\
+\texttt{services/remoteManagedSettings/} & 第8章 & 远程管理设置 \\
+\texttt{services/tokenEstimation.ts} & 第9章 & Token 估算 \\
+\texttt{services/diagnosticTracking.ts} & 第9章 & 诊断追踪 \\
+\texttt{services/preventSleep.ts} & 第9章 & 防止系统休眠 \\
+\texttt{services/notifier.ts} & 第9章 & 系统通知服务 \\
+\bottomrule
+\end{longtable}
+}

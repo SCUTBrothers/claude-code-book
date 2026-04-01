@@ -1,0 +1,154 @@
+% chapters/ch05.tex — 第5章
+\chapter{Context Engineering：上下文、记忆与压缩}
+
+\section{上下文组装：从系统提示词到完整请求}
+
+Claude Code 发送给 API 的每次请求都包含三个层次的上下文：系统提示词、记忆附件和消息历史。\texttt{src/context.ts} 负责组装前两个层次。
+
+\texttt{getSystemContext()} 和 \texttt{getUserContext()} 是两个 memoize 缓存的函数，分别收集系统级和用户级上下文信息。系统上下文包括 git 状态（分支、最近提交、工作区变更），用户上下文包括 CLAUDE.md 文件内容和记忆文件。
+
+git 状态的获取展示了并行化的设计思路：\texttt{getGitStatus()} 通过 \texttt{Promise.all} 同时执行五个 git 命令（获取分支名、默认分支、status、log、用户名），而不是串行执行。git status 输出被截断到 \texttt{MAX\_STATUS\_CHARS}（2000 字符），避免大型仓库的状态信息占用过多上下文窗口。
+
+上下文组装还支持注入机制：\texttt{systemPromptInjection} 变量允许在运行时向系统提示词注入额外内容，修改注入值时会立即清除 memoize 缓存。这是一个内部调试功能。
+
+\section{记忆系统：MEMORY.md 与自动记忆}
+
+\texttt{src/memdir/} 目录实现了 Claude Code 的记忆系统。记忆是跨会话持久化的结构化知识，存储在用户的 \texttt{\~{}/.claude/} 目录下。
+
+记忆系统的入口点是 \texttt{MEMORY.md} 文件。\texttt{memdir.ts} 定义了关键常量：
+
+\begin{itemize}
+  \item \texttt{ENTRYPOINT\_NAME}：固定为 \texttt{'MEMORY.md'}
+  \item \texttt{MAX\_ENTRYPOINT\_LINES}：200 行上限
+  \item \texttt{MAX\_ENTRYPOINT\_BYTES}：25,000 字节上限
+\end{itemize}
+
+\texttt{truncateEntrypointContent()} 函数实现了双重截断策略：先按行数截断（自然边界），再按字节数截断（在最后一个换行符处切断，避免截断到行中间）。截断时会附加警告信息，告知用户哪个限制被触发。
+
+记忆类型在 \texttt{memoryTypes.ts} 中定义，包括用户记忆（user）、反馈记忆（feedback）、项目记忆（project）和引用记忆（reference）。每种类型有不同的保存时机和使用场景。
+
+\texttt{findRelevantMemories.ts} 实现了记忆检索——根据当前对话上下文，从已存储的记忆中找出相关条目，作为附件注入到 API 请求中。
+
+记忆系统还支持团队记忆（\texttt{teamMemPaths.ts}、\texttt{teamMemPrompts.ts}），通过 \texttt{TEAMMEM} feature flag 门控。团队记忆允许多个代理共享记忆状态，这是多代理协作的基础设施之一。
+
+\section{自动压缩：compact 机制}
+
+当对话历史接近上下文窗口限制时，Claude Code 会自动触发压缩（compact）。\texttt{src/services/compact/} 目录包含 13 个文件，实现了完整的压缩子系统。
+
+\subsection{触发条件}
+
+\texttt{autoCompact.ts} 定义了自动压缩的触发逻辑。核心函数 \texttt{getEffectiveContextWindowSize()} 计算有效上下文窗口大小：
+
+\begin{lstlisting}[language=TypeScript]
+function getEffectiveContextWindowSize(model: string): number {
+  const reservedTokensForSummary = Math.min(
+    getMaxOutputTokensForModel(model),
+    MAX_OUTPUT_TOKENS_FOR_SUMMARY, // 20,000
+  )
+  return contextWindow - reservedTokensForSummary
+}
+\end{lstlisting}
+
+有效窗口 = 模型上下文窗口 - 预留的摘要输出空间（最多 20,000 token）。这个预留值基于 p99.99 的压缩摘要输出为 17,387 token 的统计数据。
+
+\texttt{AutoCompactTrackingState} 跟踪压缩状态，包括是否已压缩、轮次计数器、连续失败次数。连续失败次数作为熔断器，当上下文不可恢复地超限时停止重试。
+
+环境变量 \texttt{CLAUDE\_CODE\_AUTO\_COMPACT\_WINDOW} 允许用户自定义压缩触发的窗口大小。
+
+\subsection{压缩策略}
+
+\texttt{compact.ts} 实现了核心压缩逻辑。压缩的基本策略是：将历史消息发送给 Claude API，请求生成一个摘要，然后用摘要替换原始消息。
+
+\texttt{prompt.ts} 中的压缩提示词设计揭示了多个工程细节。首先，提示词以一段强制性的"禁止工具调用"前言开头：
+
+\begin{lstlisting}[language={}]
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+Tool calls will be REJECTED and will waste your only turn.
+\end{lstlisting}
+
+这段前言的存在有具体的工程原因：压缩请求使用 \texttt{maxTurns: 1}，如果模型尝试调用工具，工具调用会被拒绝，导致没有文本输出。源码注释记录了这个问题在 Sonnet 4.6 上的发生率（2.79\%）远高于 4.5（0.01\%），因此需要更强的前言约束。
+
+压缩输出采用两段式结构：\texttt{<analysis>} 块用于模型的思考草稿（按时间顺序分析每条消息的意图、方法、关键决策），\texttt{<summary>} 块是最终摘要。\texttt{<analysis>} 块在摘要进入上下文前会被 \texttt{formatCompactSummary()} 剥离——它只是一个提升摘要质量的中间步骤，不占用后续的上下文空间。
+
+压缩执行流程还包含 hook 集成：\texttt{executePreCompactHooks()} 在压缩前执行，\texttt{executePostCompactHooks()} 在压缩后执行。用户可以通过 hook 在压缩前后执行自定义逻辑。
+
+\texttt{compact.ts} 还处理了压缩后的上下文重建：通过 \texttt{generateFileAttachment()}、\texttt{getAgentListingDeltaAttachment()}、\texttt{getMcpInstructionsDeltaAttachment()} 等函数，将压缩后丢失的关键附件（文件状态、代理列表、MCP 指令）重新注入到压缩后的上下文中。
+
+压缩后的清理工作由 \texttt{postCompactCleanup.ts} 处理，\texttt{sessionMemoryCompact.ts} 处理会话记忆的压缩。
+
+\subsection{压缩变体}
+
+压缩系统提供了多种变体以适应不同场景：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{模块} & \textbf{用途} \\
+\midrule
+\texttt{compact.ts} & 标准压缩——完整的对话摘要 \\
+\texttt{microCompact.ts} & 微压缩——更轻量的压缩策略 \\
+\texttt{apiMicrocompact.ts} & API 级微压缩 \\
+\texttt{cachedMicrocompact.ts} & 带缓存的微压缩（feature flag 门控） \\
+\texttt{snipCompact.ts} & 片段压缩——按边界截断（feature flag 门控） \\
+\texttt{sessionMemoryCompact.ts} & 会话记忆专用压缩 \\
+\bottomrule
+\end{tabularx}
+\caption{压缩策略变体}
+\end{table}
+
+\texttt{prompt.ts} 包含压缩时使用的提示词模板，指导 Claude 如何生成有效的对话摘要。\texttt{grouping.ts} 处理消息分组逻辑，决定哪些消息应该一起被压缩。
+
+\section{会话记忆：SessionMemory}
+
+\texttt{src/services/SessionMemory/} 实现了会话级别的记忆管理。与 \texttt{memdir/} 中的持久化记忆不同，SessionMemory 管理的是单次会话内的临时状态。
+
+\texttt{sessionMemoryUtils.ts} 提供了会话记忆的工具函数，包括 \texttt{setLastSummarizedMessageId()} 等，用于跟踪压缩边界——记录最后一条被摘要的消息 ID，确保后续压缩不会重复处理已摘要的内容。
+
+\section{记忆提取：extractMemories}
+
+\texttt{src/services/extractMemories/} 实现了自动记忆提取功能。当对话中出现值得记住的信息时，系统可以自动将其提取为持久化记忆。
+
+\texttt{extractMemories.ts} 是提取逻辑的核心，\texttt{prompts.ts} 包含指导 Claude 识别和提取记忆的提示词。这个功能通过 \texttt{EXTRACT\_MEMORIES} feature flag 控制，在外部版本中默认关闭。
+
+\section{Token 估算与预算}
+
+上下文管理的基础是准确的 token 计数。\texttt{autoCompact.ts} 中引用的 \texttt{tokenCountWithEstimation()} 函数（来自 \texttt{utils/tokens.ts}）提供 token 估算能力。
+
+\texttt{getContextWindowForModel()} 根据模型名称返回对应的上下文窗口大小。不同模型有不同的窗口限制，压缩策略需要据此调整触发阈值。
+
+\texttt{QueryEngineConfig} 中的 \texttt{maxBudgetUsd} 和 \texttt{taskBudget} 字段提供了费用级别的预算控制。当累计费用接近预算时，系统会提醒用户或自动停止。
+
+图 \ref{fig:context-lifecycle} 展示了上下文管理的完整生命周期。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=4.5cm, minimum height=0.7cm, align=center, font=\small},
+  decision/.style={diamond, draw, aspect=2.5, minimum width=3cm, align=center, font=\small},
+  arrow/.style={->, thick},
+]
+  \node[box] (sys) {系统提示词组装\\(getSystemContext)};
+  \node[box, below=of sys] (mem) {记忆附件注入\\(MEMORY.md + 相关记忆)};
+  \node[box, below=of mem] (msg) {消息历史};
+  \node[box, below=of msg] (token) {Token 估算};
+  \node[decision, below=of token] (check) {超限？};
+  \node[box, below left=1cm and 0.3cm of check] (api) {发送 API 请求};
+  \node[box, below right=1cm and 0.3cm of check] (compact) {自动压缩\\(compactConversation)};
+  \node[box, below=of compact] (replace) {摘要替换历史消息};
+
+  \draw[arrow] (sys) -- (mem);
+  \draw[arrow] (mem) -- (msg);
+  \draw[arrow] (msg) -- (token);
+  \draw[arrow] (token) -- (check);
+  \draw[arrow] (check) -- node[left, font=\small] {否} (api);
+  \draw[arrow] (check) -- node[right, font=\small] {是} (compact);
+  \draw[arrow] (compact) -- (replace);
+  \draw[arrow] (replace) -| (token);
+\end{tikzpicture}
+\caption{上下文管理生命周期}
+\label{fig:context-lifecycle}
+\end{figure}
+
+整个上下文工程子系统的设计目标是：在有限的上下文窗口内，最大化信息密度。记忆系统提供跨会话的知识持久化，压缩系统在窗口接近满载时回收空间，token 估算确保系统始终知道还剩多少空间可用。这三者协同工作，使得 Claude Code 能够处理远超单次上下文窗口容量的长对话。

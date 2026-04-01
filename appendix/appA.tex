@@ -1,0 +1,71 @@
+% appendix/appA.tex — 附录A：术语表
+\chapter{术语表}
+
+{\small\setlength{\LTleft}{0pt}\setlength{\LTright}{0pt}
+\begin{longtable}{@{}p{2.8cm}p{1.8cm}p{6.2cm}p{1.2cm}@{}}
+\toprule
+\textbf{英文名} & \textbf{中文译名} & \textbf{定义} & \textbf{章节} \\
+\midrule
+\endhead
+Feature Flag & 特性开关 & 编译期布尔常量，通过 \texttt{feature()} API 控制代码路径的存废 & 第1章 \\
+\addlinespace
+MACRO & 编译期常量 & 通过 \texttt{define} 字段在构建时替换为字符串字面量的标识符 & 第1章 \\
+\addlinespace
+Bun & — & JavaScript/TypeScript 运行时与构建工具 & 第1章 \\
+\addlinespace
+Stub & 存根 & 为不可用的私有包提供最小类型兼容接口的替代实现 & 第1章 \\
+\addlinespace
+Entry Point & 入口点 & 构建和运行的起始文件（\texttt{cli.tsx}） & 第2章 \\
+\addlinespace
+REPL & 交互式循环 & Read-Eval-Print Loop，主交互模式 & 第2章 \\
+\addlinespace
+Query & 查询 & 一次用户输入到 Claude 响应完成的完整交互周期 & 第2章 \\
+\addlinespace
+QueryEngine & 查询引擎 & 管理查询生命周期、消息历史、系统提示词组装的核心组件 & 第2章 \\
+\addlinespace
+AppState & 应用状态 & 全局应用状态对象，包含消息、任务、配置等 & 第2章 \\
+\addlinespace
+Tool & 工具 & Claude 可调用的能力单元，如文件读写、命令执行等 & 第3章 \\
+\addlinespace
+ToolUseContext & 工具使用上下文 & 工具执行时的环境信息，包含权限、状态、配置等 & 第3章 \\
+\addlinespace
+Command & 命令 & 用户通过 \texttt{/} 前缀触发的斜杠命令 & 第3章 \\
+\addlinespace
+Hook & 钩子 & 在工具调用等事件前后执行的用户自定义 shell 命令 & 第3章 \\
+\addlinespace
+CanUseToolFn & 权限检查函数 & 每次工具调用前判断是否允许执行的函数 & 第3章 \\
+\addlinespace
+Ink & — & 基于 React 的终端 UI 渲染框架 & 第4章 \\
+\addlinespace
+Keybinding & 键绑定 & 键盘快捷键到操作的映射 & 第4章 \\
+\addlinespace
+Context & 上下文 & 发送给 Claude API 的消息序列与系统提示词的组合 & 第5章 \\
+\addlinespace
+Compact & 压缩 & 当上下文接近 token 限制时，对历史消息进行摘要压缩 & 第5章 \\
+\addlinespace
+Memory & 记忆 & 跨会话持久化的用户偏好、项目信息等结构化知识 & 第5章 \\
+\addlinespace
+Task & 任务 & 后台运行的工作单元（bash/agent/teammate 等类型） & 第6章 \\
+\addlinespace
+TaskType & 任务类型 & 任务分类：local\_bash, local\_agent, remote\_agent 等 & 第6章 \\
+\addlinespace
+Companion & 虚拟伙伴 & 基于用户身份生成的虚拟角色（内部功能） & 第6章 \\
+\addlinespace
+Skill & 技能 & 可复用的提示词模板，通过 \texttt{/skill-name} 触发 & 第7章 \\
+\addlinespace
+MCP & 模型上下文协议 & Model Context Protocol，标准化的工具扩展协议 & 第7章 \\
+\addlinespace
+Plugin & 插件 & 打包了 MCP 服务器和技能的分发单元 & 第7章 \\
+\addlinespace
+Bridge & 桥接 & IDE 与 Claude Code 之间的通信层（内部功能） & 第7章 \\
+\addlinespace
+PermissionMode & 权限模式 & 权限检查的严格程度级别（default/plan/auto 等） & 第8章 \\
+\addlinespace
+PolicyLimits & 策略限制 & 组织级别的功能限制策略 & 第8章 \\
+\addlinespace
+SSRF Guard & SSRF 防护 & 阻止对内网地址等敏感端点的访问 & 第8章 \\
+\addlinespace
+GrowthBook & — & 运行时特性门控与 A/B 测试框架 & 第9章 \\
+\bottomrule
+\end{longtable}
+}

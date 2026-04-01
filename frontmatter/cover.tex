@@ -1,0 +1,11 @@
+% frontmatter/cover.tex — 封面
+\clearpage
+\thispagestyle{empty}
+
+\begin{tikzpicture}[remember picture, overlay]
+  \node[anchor=center] at (current page.center) {
+    \includegraphics[width=\paperwidth,height=\paperheight]{assets/book_cover.png}
+  };
+\end{tikzpicture}
+
+\null

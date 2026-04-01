@@ -1,0 +1,186 @@
+% chapters/ch08.tex — 第8章
+\chapter{权限、安全、策略与治理}
+
+\section{权限模式：PermissionMode 的层次}
+
+Claude Code 的权限系统核心是 \texttt{PermissionMode}，定义在 \texttt{src/types/permissions.ts} 中。源码将权限模式分为外部可见和内部两个层次：
+
+\begin{lstlisting}[language=TypeScript]
+const EXTERNAL_PERMISSION_MODES = [
+  'acceptEdits',
+  'bypassPermissions',
+  'default',
+  'dontAsk',
+  'plan',
+] as const
+
+type InternalPermissionMode =
+  ExternalPermissionMode | 'auto' | 'bubble'
+\end{lstlisting}
+
+各模式的行为差异：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{模式} & \textbf{行为} \\
+\midrule
+\texttt{default} & 每次工具调用都需要用户确认 \\
+\texttt{acceptEdits} & 文件编辑自动允许，其他操作仍需确认 \\
+\texttt{plan} & 只允许只读操作，写操作需要确认 \\
+\texttt{dontAsk} & 不弹出确认对话框，不允许的操作直接拒绝 \\
+\texttt{bypassPermissions} & 跳过所有权限检查（需要显式启用） \\
+\texttt{auto} & 自动模式，通过分类器判断是否安全（feature flag 门控） \\
+\texttt{bubble} & 内部模式，用于子代理权限冒泡 \\
+\bottomrule
+\end{tabularx}
+\caption{PermissionMode 各级别行为}
+\end{table}
+
+\texttt{auto} 模式通过 \texttt{TRANSCRIPT\_CLASSIFIER} feature flag 门控，只有在该开关启用时才会出现在运行时验证集合中。\texttt{bubble} 模式是纯内部模式，不对用户暴露。
+
+\section{权限规则：来源与优先级}
+
+权限规则不是简单的布尔值，而是带有来源标记的结构化数据：
+
+\begin{lstlisting}[language=TypeScript]
+type PermissionRuleSource =
+  | 'userSettings'     // 用户全局设置
+  | 'projectSettings'  // 项目级设置
+  | 'localSettings'    // 本地设置
+  | 'flagSettings'     // 命令行标志
+  | 'policySettings'   // 组织策略
+  | 'cliArg'           // CLI 参数
+  | 'command'          // 命令触发
+  | 'session'          // 会话内设置
+
+type PermissionRule = {
+  source: PermissionRuleSource
+  ruleBehavior: PermissionBehavior  // 'allow' | 'deny' | 'ask'
+  ruleValue: PermissionRuleValue    // toolName + ruleContent
+}
+\end{lstlisting}
+
+每条规则指定了工具名称（\texttt{toolName}）和可选的规则内容（\texttt{ruleContent}），以及该规则的行为（允许、拒绝或询问）。来源标记使得系统可以追溯每条规则的设置位置，便于调试和审计。
+
+\texttt{ToolPermissionContext} 将规则按行为分为三组（\texttt{alwaysAllowRules}、\texttt{alwaysDenyRules}、\texttt{alwaysAskRules}），每组内按来源分组。规则的优先级是：deny > ask > allow，确保安全约束不会被低优先级的允许规则覆盖。
+
+整个权限上下文使用 \texttt{DeepImmutable} 包装，防止运行时意外修改权限配置。
+
+\section{工具级权限检查：CanUseToolFn}
+
+\texttt{useCanUseTool.tsx}（位于 \texttt{src/hooks/}）实现了 \texttt{CanUseToolFn} 类型的权限检查函数。每次 Claude 请求调用工具时，这个函数被调用来决定是否允许。
+
+检查流程综合考虑多个因素：
+
+\begin{enumerate}
+  \item 当前权限模式——决定默认行为
+  \item 三组规则匹配——deny 规则优先于 allow 规则
+  \item 用户的历史授权决策——"始终允许"选项会写入 \texttt{session} 来源的规则
+  \item 组织策略限制——PolicyLimits 可以覆盖用户设置
+  \item 后台代理特殊处理——\texttt{shouldAvoidPermissionPrompts} 为 true 时，无法弹出 UI 的代理自动拒绝需要确认的操作
+  \item 协调器模式——\texttt{awaitAutomatedChecksBeforeDialog} 为 true 时，先等待自动化检查（分类器、hook）再显示对话框
+\end{enumerate}
+
+图 \ref{fig:permission-check} 展示了权限检查的决策流程。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=3.8cm, minimum height=0.65cm, align=center, font=\small},
+  decision/.style={diamond, draw, aspect=2.2, minimum width=2.5cm, align=center, font=\small},
+  result/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.65cm, align=center, font=\small, fill=codebg},
+  arrow/.style={->, thick},
+]
+  \node[box] (tool) {工具调用请求};
+  \node[decision, below=of tool] (deny) {匹配 deny\\规则？};
+  \node[result, left=2cm of deny] (rejected) {拒绝};
+  \node[decision, below=of deny] (allow) {匹配 allow\\规则？};
+  \node[result, left=2cm of allow] (allowed) {允许};
+  \node[decision, below=of allow] (mode) {权限模式？};
+  \node[result, below left=0.8cm and 1cm of mode] (bypass) {允许\\(bypass)};
+  \node[box, below right=0.8cm and 1cm of mode] (ask) {弹出确认\\对话框};
+  \node[decision, below=of ask] (user) {用户决策？};
+  \node[result, left=2cm of user] (ok) {允许};
+  \node[result, right=2cm of user] (no) {拒绝};
+
+  \draw[arrow] (tool) -- (deny);
+  \draw[arrow] (deny) -- node[above, font=\scriptsize] {是} (rejected);
+  \draw[arrow] (deny) -- node[right, font=\scriptsize] {否} (allow);
+  \draw[arrow] (allow) -- node[above, font=\scriptsize] {是} (allowed);
+  \draw[arrow] (allow) -- node[right, font=\scriptsize] {否} (mode);
+  \draw[arrow] (mode) -- node[below left, font=\scriptsize] {bypass} (bypass);
+  \draw[arrow] (mode) -- node[below right, font=\scriptsize] {default/plan} (ask);
+  \draw[arrow] (ask) -- (user);
+  \draw[arrow] (user) -- node[above, font=\scriptsize] {允许} (ok);
+  \draw[arrow] (user) -- node[above, font=\scriptsize] {拒绝} (no);
+\end{tikzpicture}
+\caption{权限检查决策流程}
+\label{fig:permission-check}
+\end{figure}
+
+当权限检查需要用户确认时，\texttt{PermissionRequest} 组件渲染交互式对话框。\texttt{ToolPermissionContext} 中的 \texttt{prePlanMode} 字段记录了进入 plan 模式前的权限模式，以便退出时恢复。
+
+\section{文件系统安全边界}
+
+Claude Code 对文件系统操作实施了边界控制。\texttt{src/utils/permissions/filesystem.ts} 中的 \texttt{isScratchpadEnabled()} 和 \texttt{ensureScratchpadDir()} 函数管理 scratchpad 目录——一个受限的临时工作区。
+
+文件操作工具（FileReadTool、FileEditTool、FileWriteTool）在执行前会检查目标路径是否在允许的范围内。\texttt{additionalWorkingDirectories}（在 \texttt{ToolPermissionContext} 中）允许用户显式添加额外的可访问目录，每个额外目录都是一个 \texttt{AdditionalWorkingDirectory} 对象，包含路径和权限范围。
+
+\section{策略限制：PolicyLimits}
+
+\texttt{src/services/policyLimits/} 实现了组织级别的策略限制系统。源码注释详细说明了其设计原则：
+
+\begin{itemize}
+  \item Console 用户（API key）：全部有资格
+  \item OAuth 用户（Claude.ai）：仅 Team 和 Enterprise 订阅者有资格
+  \item API 调用采用 fail-open 策略——获取失败时继续运行，不施加限制
+  \item 无策略限制的用户收到空的限制列表
+\end{itemize}
+
+fail-open 是一个关键的设计决策：策略限制服务不可用时，系统选择继续运行而不是阻塞用户。这意味着策略限制是"尽力而为"的治理，而不是硬性的安全边界。
+
+实现细节方面，策略通过 HTTP API 获取，使用 ETag 缓存避免重复下载，本地缓存在 \texttt{policy-limits.json} 文件中。获取超时为 10 秒（\texttt{FETCH\_TIMEOUT\_MS}），最多重试 5 次（\texttt{DEFAULT\_MAX\_RETRIES}），后台每小时轮询一次（\texttt{POLLING\_INTERVAL\_MS}）。
+
+\texttt{isPolicyAllowed()} 是策略检查的核心函数，在各个功能入口处被调用。例如，Bridge 模式启动前检查 \texttt{isPolicyAllowed('allow\_remote\_control')}。
+
+\section{OAuth 认证}
+
+\texttt{src/services/oauth/} 实现了 Claude Code 的 OAuth 认证流程：
+
+\begin{itemize}
+  \item \texttt{client.ts}：OAuth 客户端实现
+  \item \texttt{auth-code-listener.ts}：授权码监听器——启动本地 HTTP 服务器接收 OAuth 回调
+  \item \texttt{crypto.ts}：PKCE（Proof Key for Code Exchange）加密支持
+  \item \texttt{getOauthProfile.ts}：获取用户 OAuth 配置文件
+\end{itemize}
+
+OAuth 流程使用 PKCE 增强安全性，这是 CLI 工具的标准做法——CLI 无法安全存储 client secret，PKCE 通过动态生成的 code verifier 替代。认证令牌存储在 macOS 钥匙串中（第 2 章提到的 \texttt{startKeychainPrefetch()} 就是预取这些令牌）。
+
+\section{SSRF 防护}
+
+\texttt{src/utils/hooks/ssrfGuard.ts} 实现了 SSRF（Server-Side Request Forgery）防护。当 Claude 请求访问 URL 时（通过 WebFetchTool），SSRF Guard 检查目标地址是否安全，阻止对内网地址、localhost、云元数据服务（如 \texttt{169.254.169.254}）等敏感端点的访问。
+
+这是一个必要的防护层——Claude 可能被提示词注入攻击诱导去访问内部服务，SSRF Guard 在网络层阻断这类请求。
+
+\section{MoreRight：权限提升}
+
+\texttt{src/moreright/useMoreRight.tsx} 实现了权限提升的 UI 交互。当用户需要从受限模式切换到更高权限模式时（例如从 \texttt{default} 切换到 \texttt{bypassPermissions}），这个组件处理确认对话框和模式切换逻辑。
+
+权限提升是单向的——用户可以在会话中提升权限，但不能降低（降低需要重新启动会话）。\texttt{isBypassPermissionsModeAvailable} 标志控制 bypass 模式是否可用，\texttt{isAutoModeAvailable} 控制 auto 模式是否可用。
+
+\section{安全模型的设计哲学}
+
+Claude Code 的安全模型遵循几个设计原则：
+
+第一，默认安全。未经明确授权的操作不会执行。权限检查发生在工具执行之前，而不是之后。
+
+第二，分层控制。从用户级（PermissionMode + 规则）到组织级（PolicyLimits）到协议级（SSRF Guard），每一层都可以独立施加约束。层与层之间的关系是"与"——所有层都通过才允许执行。
+
+第三，可审计。权限拒绝被记录在 \texttt{permissionDenials} 中，每条规则都带有来源标记（\texttt{PermissionRuleSource}），用户可以追溯哪些操作被拒绝、被哪条规则拒绝、规则来自哪个配置层级。
+
+第四，渐进式信任。用户可以从 \texttt{default} 模式开始，逐步放宽到 \texttt{acceptEdits} 或 \texttt{bypassPermissions}。"始终允许"选项将决策持久化为 \texttt{session} 来源的规则，避免重复确认。
+
+第五，fail-open vs fail-closed 的分层选择。本地权限检查是 fail-closed（检查失败则拒绝），远程策略限制是 fail-open（获取失败则不限制）。这个分层确保了：本地安全不依赖网络可用性，组织治理不阻塞个人使用。

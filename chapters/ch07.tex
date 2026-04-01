@@ -1,0 +1,164 @@
+% chapters/ch07.tex — 第7章
+\chapter{扩展系统：Commands、Skills、MCP、Plugins、Bridge}
+
+\section{扩展层次概览}
+
+Claude Code 的扩展能力不是单一机制，而是一个多层架构。从内到外，扩展层次依次为：
+
+\begin{enumerate}
+  \item 内置工具（\texttt{src/tools/}）——编译时确定，不可外部扩展
+  \item 斜杠命令（\texttt{src/commands/}）——编译时确定，部分通过 feature flag 门控
+  \item 技能系统（\texttt{src/skills/}）——运行时加载的提示词模板
+  \item MCP 协议（\texttt{src/services/mcp/}）——标准化的外部工具协议
+  \item 插件系统（\texttt{src/plugins/}）——打包了 MCP 服务器和技能的分发单元
+  \item Bridge 桥接（\texttt{src/bridge/}）——IDE 与 Claude Code 的通信层（内部功能）
+\end{enumerate}
+
+每一层都建立在前一层之上，提供更高层次的抽象和更灵活的扩展能力。
+
+\section{技能系统：可复用的提示词模板}
+
+\texttt{src/skills/} 目录实现了技能（Skill）系统。技能本质上是结构化的 markdown 文件，包含 frontmatter 元数据和提示词正文，用户通过 \texttt{/skill-name} 语法触发。
+
+\subsection{技能加载}
+
+\texttt{loadSkillsDir.ts} 负责从文件系统加载技能定义。它的 import 列表揭示了技能系统的丰富能力：frontmatter 解析（\texttt{parseFrontmatter}）、参数替换（\texttt{substituteArguments}）、shell 命令执行（\texttt{executeShellCommandsInPrompt}）、gitignore 过滤（\texttt{isPathGitignored}）、token 估算（\texttt{roughTokenCountEstimation}）。
+
+技能可以来自多个位置，按优先级排列：
+
+\begin{enumerate}
+  \item 内置技能：\texttt{src/skills/bundled/}——随 Claude Code 分发
+  \item 用户全局技能：\texttt{\~{}/.claude/skills/}——用户自定义
+  \item 项目级技能：\texttt{.claude/skills/}——项目特定
+  \item 额外目录：通过 \texttt{getAdditionalDirectoriesForClaudeMd()} 获取的附加路径
+\end{enumerate}
+
+技能文件的 frontmatter 支持多种配置：描述（用于触发匹配）、参数定义（\texttt{parseArgumentNames}）、shell 命令（\texttt{parseShellFrontmatter}）、effort 级别（\texttt{parseEffortValue}）、模型指定（\texttt{parseUserSpecifiedModel}）、工具限制（\texttt{parseSlashCommandToolsFromFrontmatter}）。
+
+一个典型的技能文件结构如下：
+
+\begin{lstlisting}[language={}]
+---
+description: 简短描述，用于触发匹配
+model: claude-sonnet-4-6
+tools: [Read, Grep, Glob]
+---
+
+技能提示词正文...
+可以包含 $ARGUMENTS 参数占位符
+\end{lstlisting}
+
+技能加载时，\texttt{roughTokenCountEstimation()} 估算提示词的 token 开销，\texttt{isPathGitignored()} 过滤被 gitignore 排除的技能文件。技能文件中还可以嵌入 shell 命令（通过 \texttt{parseShellFrontmatter}），这些命令在技能触发时执行，其输出被注入到提示词中——这使得技能可以动态收集上下文信息。
+
+\texttt{bundledSkills.ts} 注册内置技能，\texttt{mcpSkillBuilders.ts} 将 MCP 服务器的能力包装为技能接口——这意味着 MCP 工具可以通过技能系统暴露给用户，提供更友好的 \texttt{/skill-name} 调用方式。
+
+\texttt{SkillTool}（位于 \texttt{src/tools/SkillTool/}）是技能系统与工具系统的桥梁——当 Claude 决定调用一个技能时，它通过 SkillTool 执行。技能系统通过 \texttt{MCP\_SKILLS} feature flag 控制，在外部版本中默认启用。
+
+\section{MCP 协议集成}
+
+\texttt{src/services/mcp/} 是 Claude Code 中最复杂的扩展子系统之一，包含 20 余个文件。MCP（Model Context Protocol）是一个标准化协议，允许外部服务向 Claude 提供工具、资源和提示词。
+
+\subsection{客户端协议}
+
+\texttt{client.ts} 实现了完整的 MCP 客户端。从 import 列表可以看到它使用了 \texttt{@modelcontextprotocol/sdk} 的多个模块：
+
+\begin{itemize}
+  \item \texttt{Client}：MCP 客户端核心类
+  \item \texttt{StdioClientTransport}：标准 I/O 传输——通过子进程的 stdin/stdout 通信
+  \item \texttt{SSEClientTransport}：Server-Sent Events 传输——通过 HTTP 长连接通信
+  \item \texttt{StreamableHTTPClientTransport}：可流式 HTTP 传输
+\end{itemize}
+
+客户端支持 MCP 协议的三种核心能力：工具（\texttt{ListToolsResult}、\texttt{CallToolResultSchema}）、资源（\texttt{ListResourcesResultSchema}）和提示词（\texttt{ListPromptsResult}）。
+
+\texttt{ElicitRequestSchema} 处理 MCP 的 elicitation 机制——当 MCP 工具需要用户提供额外输入时（如 OAuth 授权），它通过 elicitation 请求触发交互式对话框。
+
+MCP 工具在 Claude Code 中被包装为 \texttt{MCPTool}（\texttt{src/tools/MCPTool/}），资源通过 \texttt{ListMcpResourcesTool} 和 \texttt{ReadMcpResourceTool} 访问，认证通过 \texttt{McpAuthTool} 处理。
+
+图 \ref{fig:mcp-tool-wrapping} 展示了 MCP 工具从外部服务器到 Claude 可调用工具的包装层次。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=4cm, minimum height=0.65cm, align=center, font=\small},
+  arrow/.style={->, thick},
+]
+  \node[box] (server) {外部 MCP 服务器};
+  \node[box, below=of server] (transport) {传输层\\(stdio / SSE / HTTP)};
+  \node[box, below=of transport] (client) {MCP Client\\(@modelcontextprotocol/sdk)};
+  \node[box, below=of client] (manager) {MCPConnectionManager\\(连接生命周期管理)};
+  \node[box, below=of manager] (wrap) {MCPTool / ListMcpResourcesTool\\/ ReadMcpResourceTool / McpAuthTool};
+  \node[box, below=of wrap] (tool) {Claude 工具系统\\(findToolByName)};
+
+  \draw[arrow] (server) -- (transport);
+  \draw[arrow] (transport) -- (client);
+  \draw[arrow] (client) -- (manager);
+  \draw[arrow] (manager) -- (wrap);
+  \draw[arrow] (wrap) -- (tool);
+\end{tikzpicture}
+\caption{MCP 工具包装层次}
+\label{fig:mcp-tool-wrapping}
+\end{figure}
+
+\subsection{连接管理}
+
+\texttt{MCPConnectionManager.tsx} 是 MCP 连接的核心管理器，它是一个 React 组件（\texttt{.tsx} 扩展名），负责 MCP 服务器的发现、连接、断开和重连。作为 React 组件意味着连接状态变更会自动触发 UI 更新。
+
+\texttt{config.ts} 处理 MCP 服务器配置的解析和验证，\texttt{normalization.ts} 统一不同来源的配置格式，\texttt{envExpansion.ts} 处理配置中的环境变量展开。
+
+\subsection{安全与权限}
+
+\texttt{auth.ts} 处理 MCP 服务器的认证，\texttt{channelPermissions.ts} 和 \texttt{channelAllowlist.ts} 控制哪些 MCP 通道被允许。\texttt{channelNotification.ts} 在新 MCP 通道连接时通知用户。
+
+\texttt{officialRegistry.ts} 管理官方 MCP 服务器注册表——\texttt{prefetchOfficialMcpUrls()}（在 \texttt{main.tsx} 中调用）预取官方注册表，加速 MCP 服务器的发现。
+
+\texttt{xaa.ts} 和 \texttt{xaaIdpLogin.ts} 处理企业级身份认证集成，支持组织内部的 MCP 服务器认证。
+
+\section{插件系统}
+
+\texttt{src/plugins/} 目录实现了插件系统。插件是 MCP 服务器和技能的打包分发单元。一个插件可以包含：MCP 服务器定义、技能模板、配置文件。
+
+\texttt{builtinPlugins.ts} 注册内置插件，\texttt{bundled/} 目录包含打包的插件资源。用户通过 \texttt{/mcp} 命令或配置文件安装和管理插件。
+
+插件系统的加载由 \texttt{loadAllPluginsCacheOnly()}（在 \texttt{QueryEngine.ts} 中引用）处理，它从缓存中加载已安装的插件，避免每次启动都重新解析。\texttt{skillChangeDetector.ts}（在 \texttt{main.tsx} 中引用）监控技能文件变更，支持热重载。
+
+\section{Bridge 桥接层}
+
+\texttt{src/bridge/} 目录包含 20 余个文件，实现了 Claude Code 与 IDE 之间的桥接通信。这是一个内部功能，通过 \texttt{BRIDGE\_MODE} feature flag 门控。
+
+Bridge 的核心架构分为三层：
+
+\paragraph{连接层}
+\texttt{bridgeMain.ts} 是桥接模式的主入口，\texttt{bridgeConfig.ts} 和 \texttt{bridgeEnabled.ts} 处理配置与启用检查。启动前需要通过 OAuth 认证检查和 GrowthBook 运行时门控。
+
+\paragraph{通信层}
+\texttt{bridgeMessaging.ts} 定义消息传递协议，\texttt{bridgeApi.ts} 定义桥接 API。\texttt{inboundMessages.ts} 和 \texttt{inboundAttachments.ts} 处理从 IDE 传入的消息和附件。\texttt{createSession.ts} 和 \texttt{codeSessionApi.ts} 管理桥接会话。
+
+\paragraph{安全层}
+\texttt{bridgePermissionCallbacks.ts} 处理权限回调——IDE 端的权限确认需要通过桥接传回 Claude Code。\texttt{jwtUtils.ts} 处理 JWT token 认证。\texttt{capacityWake.ts} 和 \texttt{flushGate.ts} 处理连接容量控制。
+
+Bridge 模式允许 IDE（如 VS Code、JetBrains）作为 Claude Code 的前端，终端界面被 IDE 的 UI 替代。\texttt{bridgeUI.ts} 负责 UI 适配，\texttt{initReplBridge.ts} 在 REPL 启动时初始化桥接连接。
+
+\section{扩展系统的设计权衡}
+
+多层扩展架构的设计反映了不同的扩展需求：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{层次} & \textbf{复杂度} & \textbf{适用场景} \\
+\midrule
+技能 & 低（markdown 文件） & 提示词模板、工作流快捷方式 \\
+MCP & 中（需实现服务器） & 外部工具集成、数据源接入 \\
+插件 & 中（打包分发） & 完整的功能扩展包 \\
+Bridge & 高（协议对接） & IDE 深度集成（仅内部） \\
+\bottomrule
+\end{tabularx}
+\caption{扩展层次的复杂度与适用场景}
+\end{table}
+
+这种分层设计的好处是：简单需求用简单机制（技能），复杂需求用复杂机制（MCP/插件），极端需求用极端机制（Bridge）。用户不需要为了添加一个提示词模板而去实现一个 MCP 服务器。
+
+从实现角度看，技能系统的成本最低——只需要文件系统读取和 frontmatter 解析。MCP 的成本最高——需要管理子进程生命周期、处理多种传输协议、实现认证和权限控制。插件系统介于两者之间，它复用了 MCP 和技能的基础设施，只增加了打包和分发的逻辑。

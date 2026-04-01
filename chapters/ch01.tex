@@ -1,0 +1,233 @@
+% chapters/ch01.tex — 第1章
+\chapter{构建系统与工程基线}
+
+\section{项目概览：规模、依赖与技术栈}
+
+Claude Code 是一个大型 TypeScript 项目。\texttt{src/} 目录包含 1906 个核心源文件，覆盖终端 UI、工具执行、上下文管理、权限控制、插件系统等多个子系统。
+
+项目的技术栈选型围绕三个核心决策展开。
+
+第一，构建工具选择 Bun。\texttt{package.json} 中 \texttt{"build": "bun run build.ts"} 表明构建流程由 Bun 驱动。选择 Bun 而非 webpack 或 esbuild 的直接原因是源码大量使用了 \texttt{bun:bundle} 模块提供的 \texttt{feature()} API——这是 Bun bundler 的专有特性，用于编译期特性门控。
+
+第二，模块体系采用 ESM。\texttt{package.json} 声明 \texttt{"type": "module"}，\texttt{tsconfig.json} 配置 \texttt{"module": "ESNext"} 和 \texttt{"moduleResolution": "bundler"}。构建产出也是 ESM 格式。
+
+第三，终端 UI 基于 React。\texttt{tsconfig.json} 中 \texttt{"jsx": "react-jsx"} 和 \texttt{"jsxImportSource": "react"} 表明项目使用 React JSX 语法。具体的终端渲染引擎是 Ink（一个基于 React 的终端 UI 框架），这将在第 4 章详细讨论。
+
+依赖方面，\texttt{package.json} 声明了大量依赖，其中几个值得关注：
+
+\begin{itemize}
+  \item \texttt{@anthropic-ai/sdk}（0.80.0）：Anthropic 官方 SDK，负责与 Claude API 通信
+  \item \texttt{@modelcontextprotocol/sdk}（1.29.0）：MCP 协议 SDK，支撑工具扩展体系
+  \item \texttt{@commander-js/extra-typings}（14.0.0）：CLI 参数解析
+  \item 多个 \texttt{@opentelemetry/*} 包：可观测性基础设施
+  \item 多个 \texttt{@aws-sdk/*} 和 \texttt{@azure/*} 包：多云 API 支持
+\end{itemize}
+
+构建入口点是 \texttt{src/entrypoints/cli.tsx}，最终打包为单文件 \texttt{dist/cli.js}，体积约 22MB。
+
+\section{Bun 构建流程：从源码到单文件产物}
+
+\texttt{build.ts} 是整个构建流程的核心，总共不到 200 行代码，但承载了四个关键职责：定义特性开关、注入编译期常量、配置构建插件、执行后处理。
+
+构建调用的核心是 \texttt{Bun.build()}：
+
+\begin{lstlisting}[language=TypeScript]
+const result = await Bun.build({
+  entrypoints: ['./src/entrypoints/cli.tsx'],
+  outdir: './dist',
+  target: 'node',
+  format: 'esm',
+  sourcemap: 'linked',
+  minify: false,
+  define: { /* MACRO 常量 */ },
+  external: ['*.node', 'sharp', '@img/*'],
+  plugins: [ /* 两个构建插件 */ ],
+})
+\end{lstlisting}
+
+几个配置值得注意。\texttt{target: 'node'} 表明产物运行在 Node.js 环境而非浏览器。\texttt{minify: false} 说明外部版本不做代码压缩。\texttt{external} 数组排除了 \texttt{.node} 原生模块和 \texttt{sharp} 图像库，这些在运行时动态加载。
+
+构建完成后，脚本执行两步后处理：在产物头部添加 shebang（\texttt{\#!/usr/bin/env node}），然后设置 755 可执行权限。这使得 \texttt{dist/cli.js} 可以直接作为命令行工具运行。
+
+图 \ref{fig:build-pipeline} 展示了完整的构建流程。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.8cm and 1.2cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=2.2cm, minimum height=0.7cm, align=center, font=\scriptsize},
+  plugin/.style={rectangle, draw, dashed, rounded corners, minimum width=2.2cm, minimum height=0.7cm, align=center, font=\scriptsize, fill=codebg},
+  arrow/.style={->, thick},
+]
+  % Source
+  \node[box] (src) {src/entrypoints/\\cli.tsx};
+  \node[box, right=of src] (bun) {Bun.build()};
+  \node[box, right=of bun] (out) {dist/cli.js\\(22MB)};
+  \node[box, right=of out] (post) {shebang\\chmod 755};
+
+  % Plugins
+  \node[plugin, below=0.8cm of bun] (feat) {feature-shim\\插件};
+  \node[plugin, below=0.5cm of feat] (text) {text-file-loader\\插件};
+
+  % Inputs
+  \node[box, below=0.5cm of text] (flags) {featureFlags\\(90+ 开关)};
+  \node[box, left=of flags] (macros) {MACRO 常量\\(版本/时间)};
+
+  % Arrows
+  \draw[arrow] (src) -- (bun);
+  \draw[arrow] (bun) -- (out);
+  \draw[arrow] (out) -- (post);
+  \draw[arrow] (feat) -- (bun);
+  \draw[arrow] (text) -- (bun);
+  \draw[arrow] (flags) -- (feat);
+  \draw[arrow] (macros) -- (bun);
+\end{tikzpicture}
+\caption{Claude Code 构建流程}
+\label{fig:build-pipeline}
+\end{figure}
+
+构建流程中最关键的设计是两个自定义插件，它们分别处理特性开关和文本文件内联。
+
+第一个插件 \texttt{bun-bundle-feature-shim} 拦截所有对 \texttt{bun:bundle} 的导入，将 \texttt{feature()} 函数替换为一个查表实现。表中的键值对来自 \texttt{build.ts} 顶部定义的 \texttt{featureFlags} 对象。由于表中的值都是布尔字面量，Bun 的 tree-shaking 会消除所有 \texttt{if (feature('SOME\_FLAG'))} 中条件为 \texttt{false} 的分支，实现编译期死代码消除。
+
+第二个插件 \texttt{text-file-loader} 将 \texttt{.md} 和 \texttt{.txt} 文件转换为 JavaScript 模块（导出文件内容字符串），并将 \texttt{.d.ts} 类型声明文件替换为空模块。这意味着源码中可以直接导入 markdown 文件作为字符串使用——系统提示词等文本资源就是通过这种方式内联到构建产物中的。
+
+\section{特性开关：编译期产品形态控制}
+
+\texttt{build.ts} 的前 100 行定义了一个 \texttt{featureFlags} 对象，包含 90 余个布尔开关。这些开关不是运行时配置，而是编译期常量——它们在构建时被替换为 \texttt{true} 或 \texttt{false} 字面量，由 bundler 执行死代码消除。
+
+源码中使用特性开关的典型模式如下：
+
+\begin{lstlisting}[language=TypeScript]
+import { feature } from 'bun:bundle'
+
+const coordinatorModule = feature('COORDINATOR_MODE')
+  ? require('./coordinator/coordinatorMode.js')
+  : null
+\end{lstlisting}
+
+当 \texttt{COORDINATOR\_MODE} 为 \texttt{false} 时，整个 \texttt{require} 分支在构建时被消除，相关模块不会进入最终产物。
+
+从 \texttt{build.ts} 中可以将这些开关分为三类。
+
+\paragraph{外部版本启用的开关}
+
+\begin{itemize}
+  \item \texttt{BUILTIN\_EXPLORE\_PLAN\_AGENTS}：内置的探索和计划代理
+  \item \texttt{TOKEN\_BUDGET}：Token 预算显示
+  \item \texttt{MCP\_SKILLS}：MCP 技能系统
+  \item \texttt{COMPACTION\_REMINDERS}：上下文压缩提醒
+\end{itemize}
+
+\paragraph{内部功能开关（外部版本关闭）}
+
+\begin{itemize}
+  \item \texttt{BRIDGE\_MODE}：IDE 桥接模式
+  \item \texttt{COORDINATOR\_MODE}：多代理协调
+  \item \texttt{KAIROS}：助手模式（含 KAIROS\_DREAM、KAIROS\_CHANNELS 等子开关）
+  \item \texttt{DAEMON}：后台守护进程
+  \item \texttt{BUDDY}：子代理系统
+\end{itemize}
+
+\paragraph{实验性功能开关}
+
+\begin{itemize}
+  \item \texttt{VOICE\_MODE}：语音输入
+  \item \texttt{WEB\_BROWSER\_TOOL}：浏览器工具
+  \item \texttt{ULTRAPLAN} / \texttt{ULTRATHINK}：增强规划与思考
+\end{itemize}
+
+这套机制的工程意义在于：同一份源码库通过不同的开关组合，可以产出面向不同场景的产品变体。外部用户拿到的 npm 包是一个特定开关组合的构建结果，而 Anthropic 内部可能运行着启用了更多功能的版本。
+
+\texttt{cli.tsx} 入口文件中可以直接观察到这种模式的实际效果。例如，\texttt{-{}-daemon-worker} 参数处理被 \texttt{feature('DAEMON')} 门控，\texttt{remote-control} 子命令被 \texttt{feature('BRIDGE\_MODE')} 门控。在外部构建中，这些代码路径被完全消除，用户甚至无法通过命令行参数触发它们。
+
+\section{MACRO 常量：编译期值注入}
+
+除了布尔开关，\texttt{build.ts} 还通过 \texttt{define} 字段注入了一组编译期常量：
+
+\begin{lstlisting}[language=TypeScript]
+define: {
+  'MACRO.VERSION': JSON.stringify('2.1.88'),
+  'MACRO.BUILD_TIME': JSON.stringify(BUILD_TIME),
+  'MACRO.ISSUES_EXPLAINER': JSON.stringify('report ...'),
+  'MACRO.FEEDBACK_CHANNEL': JSON.stringify('https://...'),
+  'MACRO.PACKAGE_URL': JSON.stringify('https://...'),
+}
+\end{lstlisting}
+
+这些 \texttt{MACRO.*} 标识符在源码中以全局变量形式使用，构建时被替换为对应的字符串字面量。例如 \texttt{cli.tsx} 中的版本输出：
+
+\begin{lstlisting}[language=TypeScript]
+console.log(`${MACRO.VERSION} (Claude Code)`)
+// -> "2.1.88 (Claude Code)"
+\end{lstlisting}
+
+MACRO 与 feature flag 的区别在于：feature flag 是布尔门控，控制代码路径的存废；MACRO 是值替换，将构建时信息注入运行时。两者都在编译期完成替换，运行时不存在任何查询开销。
+
+另外，\texttt{Bun.env.NODE\_ENV} 被定义为 \texttt{'production'}，这会影响 React 和其他库的行为模式。
+
+\section{依赖管理：私有包存根与第三方补丁}
+
+Claude Code 的依赖中有若干不在公开 npm registry 中的内部包。\texttt{package.json} 通过 \texttt{file:./stubs/...} 语法将它们指向本地存根目录：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{存根包} & \textbf{用途} \\
+\midrule
+\texttt{color-diff-napi} & 语法高亮 native 模块，存根禁用高亮功能 \\
+\texttt{modifiers-napi} & macOS 按键修饰符检测，存根返回空 \\
+\texttt{@ant/claude-for-chrome-mcp} & Chrome 扩展 MCP 服务器 \\
+\texttt{@anthropic-ai/mcpb} & MCP bundle 处理器 \\
+\texttt{@anthropic-ai/sandbox-runtime} & 沙盒运行时 \\
+\bottomrule
+\end{tabularx}
+\caption{私有包存根清单}
+\end{table}
+
+这些存根提供了最小的类型兼容接口，使得构建可以通过，但相关功能在外部版本中不可用。
+
+第三方补丁方面，\texttt{pnpm-workspace.yaml} 声明了一个补丁：
+
+\begin{lstlisting}[language={}]
+patchedDependencies:
+  commander@14.0.3: patches/commander@14.0.3.patch
+\end{lstlisting}
+
+这个补丁修改了 commander 库的 \texttt{splitOptionFlags} 函数，将短选项的正则表达式从只允许单字符改为允许多字符。原因是 Claude Code 使用了 \texttt{-d2e} 作为调试标志的短选项，而 commander v14 的标准实现只支持单字符短选项如 \texttt{-v}。
+
+这是一个典型的最小侵入式补丁：只改一行正则，不改变 commander 的其他行为，且通过 pnpm 的 patch 机制管理，升级 commander 时补丁会自动提示冲突。
+
+\section{Native 模块体系：vendor 目录}
+
+\texttt{vendor/} 目录包含 4 个 native 模块的 TypeScript 包装器：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{模块} & \textbf{平台} & \textbf{用途} \\
+\midrule
+\texttt{audio-capture-src} & macOS, Linux, Windows & 音频采集（录音与播放） \\
+\texttt{image-processor-src} & 跨平台 & 图像处理（sharp 兼容 API） \\
+\texttt{modifiers-napi-src} & macOS & 按键修饰符检测 \\
+\texttt{url-handler-src} & macOS & URL 事件处理（Apple Event） \\
+\bottomrule
+\end{tabularx}
+\caption{vendor 目录 native 模块清单}
+\end{table}
+
+这四个模块共享相同的加载策略：懒加载、平台检测、多路径回退。以 \texttt{audio-capture-src} 为例：
+
+\begin{enumerate}
+  \item 首次调用时才尝试加载 native 模块（\texttt{loadAttempted} 标志位）
+  \item 先检查平台是否支持（\texttt{process.platform}）
+  \item 优先尝试 bundled 路径（通过环境变量 \texttt{AUDIO\_CAPTURE\_NODE\_PATH}）
+  \item 回退到 npm-install 路径和 dev 路径
+  \item 所有路径都失败则返回 \texttt{null}，调用方通过返回值判断功能是否可用
+\end{enumerate}
+
+这种设计的工程考量是：native 模块的可用性取决于平台和安装方式，不能假设它一定存在。通过懒加载避免了启动时的 \texttt{dlopen} 开销，通过多路径回退兼容了不同的部署场景（开发、npm 安装、Bun 编译打包）。
+
+\texttt{image-processor-src} 比较特殊——它提供了一个与 \texttt{sharp} 库 API 兼容的接口（\texttt{metadata()}、\texttt{resize()}、\texttt{jpeg()}、\texttt{png()}、\texttt{toBuffer()} 等），但底层使用自研的 native 模块而非 sharp 本身。\texttt{build.ts} 中 \texttt{external: ['sharp', '@img/*']} 将 sharp 排除在构建之外，运行时由这个 vendor 模块替代。

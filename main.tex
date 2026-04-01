@@ -1,0 +1,180 @@
+% -*- coding: utf-8 -*-
+% 深入浅出 Claude Code — 主控文件
+% 编译方式: latexmk -xelatex main.tex
+%
+\documentclass[a4paper,12pt,openany,fontset=fandol]{ctexbook}
+
+% ============================================================
+%  宏 包
+% ============================================================
+
+% 页面布局
+\usepackage[
+  top=2.5cm, bottom=2.5cm,
+  left=2.8cm, right=2.8cm,
+  headheight=15pt
+]{geometry}
+
+% 颜色（需在 listings/hyperref 之前加载）
+\usepackage{xcolor}
+
+% 代码排版
+\usepackage{listings}
+
+% 彩色盒子
+\usepackage[most]{tcolorbox}
+
+% 绘图
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric}
+
+% 表格
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{longtable}
+
+% 图片
+\usepackage{graphicx}
+
+% 页眉页脚
+\usepackage{fancyhdr}
+
+% 超链接（建议放在最后加载）
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks  = true,
+  linkcolor   = blue!70!black,
+  citecolor   = green!50!black,
+  urlcolor    = blue!60!black,
+  bookmarksnumbered = true,
+  pdfstartview = FitH,
+  pdftitle    = {深入浅出 Claude Code},
+  pdfauthor   = {},
+}
+
+% ============================================================
+%  颜色定义
+% ============================================================
+\definecolor{codebg}{HTML}{F5F5F5}
+\definecolor{codeframe}{HTML}{CCCCCC}
+\definecolor{codekw}{HTML}{0000FF}
+\definecolor{codecomment}{HTML}{008000}
+\definecolor{codestring}{HTML}{A31515}
+\definecolor{codenumber}{HTML}{999999}
+
+% ============================================================
+%  listings 代码样式
+% ============================================================
+
+% --- TypeScript / JavaScript 语言定义 ---
+\lstdefinelanguage{TypeScript}{
+  keywords={break, case, catch, class, const, continue, debugger,
+    default, delete, do, else, enum, export, extends, finally,
+    for, function, if, import, in, instanceof, let, new, return,
+    super, switch, this, throw, try, typeof, var, void, while,
+    with, yield, async, await, of, type, interface, implements,
+    declare, namespace, module, abstract, as, from, static,
+    readonly, keyof, infer, never, unknown, any, is},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+  morestring=[b]',
+  morestring=[b]`,
+}
+
+% --- 默认代码样式 ---
+\lstdefinestyle{codestyle}{
+  backgroundcolor  = \color{codebg},
+  basicstyle       = \small\ttfamily,
+  keywordstyle     = \color{codekw}\bfseries,
+  commentstyle     = \color{codecomment},
+  stringstyle      = \color{codestring},
+  numberstyle      = \tiny\color{codenumber},
+  numbers          = left,
+  numbersep        = 8pt,
+  frame            = single,
+  rulecolor        = \color{codeframe},
+  breaklines       = true,
+  breakatwhitespace= false,
+  tabsize          = 2,
+  showstringspaces = false,
+  captionpos       = b,
+  xleftmargin      = 1em,
+  framexleftmargin = 1em,
+}
+
+\lstset{style=codestyle}
+
+% --- 允许 \texttt 中的长路径自动断行 ---
+\newcommand{\origttfamily}{}
+\let\origttfamily\ttfamily
+\renewcommand{\ttfamily}{\origttfamily\hyphenchar\font=`\-\relax}
+\tolerance=1000
+\emergencystretch=1em
+
+% --- tcolorbox 代码盒子 ---
+\newtcolorbox{codebox}[1][]{
+  colback   = codebg,
+  colframe  = codeframe,
+  fonttitle = \small\bfseries\ttfamily,
+  boxrule   = 0.5pt,
+  arc       = 2pt,
+  left      = 6pt,
+  right     = 6pt,
+  top       = 4pt,
+  bottom    = 4pt,
+  #1
+}
+
+% ============================================================
+%  页眉页脚
+% ============================================================
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\small\nouppercase{\leftmark}}
+\fancyhead[RO]{\small\nouppercase{\rightmark}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ============================================================
+%  正文
+% ============================================================
+\begin{document}
+
+% ---------- 前置部分 ----------
+\frontmatter
+
+\input{frontmatter/cover}
+\input{frontmatter/titlepage}
+\input{frontmatter/praise}
+\input{frontmatter/foreword}
+\input{frontmatter/guide}
+
+\tableofcontents
+
+% ---------- 主体部分 ----------
+\mainmatter
+
+\input{chapters/ch01}
+
+% 以下章节待创建后取消注释
+\input{chapters/ch02}
+\input{chapters/ch03}
+\input{chapters/ch04}
+\input{chapters/ch05}
+\input{chapters/ch06}
+\input{chapters/ch07}
+\input{chapters/ch08}
+\input{chapters/ch09}
+\input{chapters/ch10}
+
+% ---------- 附录 ----------
+\appendix
+\input{appendix/appA}
+\input{appendix/appB}
+
+% ---------- 后置部分 ----------
+\backmatter
+
+\end{document}

@@ -1,0 +1,176 @@
+% chapters/ch03.tex — 第3章
+\chapter{Tool、Command 与 Hook：执行系统的主干}
+
+\section{工具类型系统：Tool.ts 的设计}
+
+Claude Code 的工具系统定义在 \texttt{src/Tool.ts} 中。这个文件不包含具体工具的实现，而是定义了工具的类型系统——所有工具必须遵循的接口契约。
+
+\texttt{ToolUseContext} 是工具执行时的环境对象，包含工具运行所需的一切：可用命令列表、调试标志、模型名称、MCP 客户端连接、中断控制器、文件状态缓存、全局应用状态的读写接口。它是工具与系统其余部分之间的桥梁。
+
+\texttt{ToolPermissionContext} 定义了权限检查的完整上下文，采用 \texttt{DeepImmutable} 包装确保不可变性：
+
+\begin{lstlisting}[language=TypeScript]
+type ToolPermissionContext = DeepImmutable<{
+  mode: PermissionMode
+  alwaysAllowRules: ToolPermissionRulesBySource
+  alwaysDenyRules: ToolPermissionRulesBySource
+  alwaysAskRules: ToolPermissionRulesBySource
+  isBypassPermissionsModeAvailable: boolean
+  shouldAvoidPermissionPrompts?: boolean
+}>
+\end{lstlisting}
+
+权限模式（\texttt{PermissionMode}）决定了工具执行前的检查严格程度。\texttt{alwaysAllowRules}、\texttt{alwaysDenyRules}、\texttt{alwaysAskRules} 三组规则按来源分组，支持用户在不同层级（全局、项目、会话）配置权限策略。这个设计将在第 8 章详细讨论。
+
+\section{工具注册：tools.ts 的组装逻辑}
+
+\texttt{src/tools.ts} 负责将所有工具实例组装为一个可用工具集合。它的 import 列表直接反映了 Claude Code 提供的内置工具：
+
+\begin{table}[htbp]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{工具} & \textbf{用途} \\
+\midrule
+\texttt{BashTool} & 执行 shell 命令 \\
+\texttt{FileReadTool} & 读取文件内容 \\
+\texttt{FileEditTool} & 编辑文件（精确替换） \\
+\texttt{FileWriteTool} & 创建或覆写文件 \\
+\texttt{GlobTool} & 文件模式匹配搜索 \\
+\texttt{GrepTool} & 文件内容正则搜索 \\
+\texttt{AgentTool} & 派生子代理执行复杂任务 \\
+\texttt{SkillTool} & 调用技能模板 \\
+\texttt{WebFetchTool} & 获取网页内容 \\
+\texttt{WebSearchTool} & 网页搜索 \\
+\texttt{NotebookEditTool} & 编辑 Jupyter notebook \\
+\texttt{LSPTool} & 语言服务器协议交互 \\
+\texttt{TodoWriteTool} & 任务列表管理 \\
+\texttt{TaskOutputTool} & 读取后台任务输出 \\
+\texttt{TaskStopTool} & 停止后台任务 \\
+\bottomrule
+\end{tabularx}
+\caption{Claude Code 核心内置工具}
+\end{table}
+
+工具注册同样使用 feature flag 进行条件加载。例如 \texttt{SleepTool} 只在 \texttt{PROACTIVE} 或 \texttt{KAIROS} 启用时加载，\texttt{CronCreateTool} 等定时任务工具只在 \texttt{AGENT\_TRIGGERS} 启用时加载。部分工具还通过 \texttt{process.env.USER\_TYPE === 'ant'} 限制为内部用户专用。
+
+每个工具目录（如 \texttt{tools/BashTool/}）通常包含工具实现、输入 schema 定义和相关的辅助函数。工具通过 \texttt{findToolByName()} 函数按名称查找，这个函数在 \texttt{query()} 处理 Claude API 返回的 \texttt{tool\_use} block 时被调用。
+
+\subsection{BashTool：命令执行与安全检查}
+
+\texttt{tools/BashTool/} 是最复杂的工具实现之一，包含 18 个文件。除了核心的 \texttt{BashTool.tsx}，它还包含一套完整的安全检查体系：
+
+\begin{itemize}
+  \item \texttt{bashSecurity.ts}：检测危险的 shell 模式——命令替换（\texttt{\$()}、\texttt{\$\{\}}）、进程替换（\texttt{<()}、\texttt{>()}）、Zsh 特有的扩展语法（\texttt{=cmd}、glob 限定符）、甚至 PowerShell 注释语法（防御性深度）
+  \item \texttt{bashPermissions.ts}：工具级权限检查
+  \item \texttt{destructiveCommandWarning.ts}：检测破坏性命令（如 \texttt{rm -rf}）并发出警告
+  \item \texttt{pathValidation.ts}：验证命令中的文件路径是否在允许范围内
+  \item \texttt{readOnlyValidation.ts}：在只读模式下验证命令是否安全
+  \item \texttt{sedValidation.ts} / \texttt{sedEditParser.ts}：专门针对 \texttt{sed} 命令的编辑操作解析与验证
+  \item \texttt{commandSemantics.ts}：命令语义分析
+  \item \texttt{shouldUseSandbox.ts}：判断是否应在沙盒中执行
+\end{itemize}
+
+\texttt{bashSecurity.ts} 中的安全模式检测覆盖了多种 shell 注入向量。例如，Zsh 的 \texttt{=cmd} 语法会将 \texttt{=curl} 展开为 \texttt{/usr/bin/curl}，绕过基于命令名的 deny 规则。源码注释详细解释了每种模式的攻击场景。
+
+\subsection{AgentTool：子代理派生}
+
+\texttt{tools/AgentTool/} 包含 15 个文件，实现了子代理的完整生命周期。\texttt{runAgent.ts} 是核心——它直接调用 \texttt{query()} 函数创建一个独立的查询循环，子代理拥有自己的系统提示词、消息历史和工具集合。
+
+\texttt{loadAgentsDir.ts} 从文件系统加载代理定义（\texttt{.claude/agents/} 目录），\texttt{builtInAgents.ts} 注册内置代理（如 Explore、Plan 代理）。\texttt{agentMemory.ts} 管理子代理的记忆隔离，\texttt{forkSubagent.ts} 处理子代理的派生逻辑。
+
+\texttt{prompt.ts} 中的 \texttt{DEFAULT\_AGENT\_PROMPT} 定义了子代理的默认系统提示词，\texttt{enhanceSystemPromptWithEnvDetails()} 将环境信息（工作目录、git 状态等）注入到子代理的提示词中。
+
+\section{命令系统：斜杠命令的注册与分发}
+
+\texttt{src/commands.ts} 是斜杠命令的注册中心。它导入了 40 余个命令模块，每个模块对应一个 \texttt{/command} 命令。
+
+从 import 列表可以看到命令的完整清单，涵盖多个类别：
+
+\begin{itemize}
+  \item 会话管理：\texttt{/clear}、\texttt{/compact}、\texttt{/resume}、\texttt{/session}
+  \item 代码操作：\texttt{/commit}、\texttt{/diff}、\texttt{/review}
+  \item 配置与状态：\texttt{/config}、\texttt{/cost}、\texttt{/status}、\texttt{/usage}
+  \item 扩展系统：\texttt{/mcp}、\texttt{/skills}、\texttt{/tasks}
+  \item 用户界面：\texttt{/theme}、\texttt{/vim}、\texttt{/keybindings}
+  \item 认证与账户：\texttt{/login}、\texttt{/logout}
+  \item 辅助功能：\texttt{/help}、\texttt{/doctor}、\texttt{/memory}、\texttt{/context}
+\end{itemize}
+
+命令同样使用 feature flag 进行条件注册。\texttt{/proactive} 命令需要 \texttt{PROACTIVE} 或 \texttt{KAIROS} 开关，\texttt{/bridge} 命令需要 \texttt{BRIDGE\_MODE} 开关，\texttt{/voice} 命令需要 \texttt{VOICE\_MODE} 开关。在外部构建中，这些命令不存在。
+
+命令与工具的区别在于：工具由 Claude 模型在响应中主动调用（通过 \texttt{tool\_use} block），命令由用户通过 \texttt{/} 前缀手动触发。两者共享相同的执行上下文（\texttt{ToolUseContext}），但触发路径不同。
+
+\section{Hook 系统：生命周期事件拦截}
+
+\texttt{src/hooks/} 目录包含 80 余个 React hook，构成了 Claude Code 的生命周期事件系统。这些 hook 不是传统意义上的"钩子函数"，而是 React 自定义 hook——它们在 Ink 组件树中被调用，管理各种副作用和状态。
+
+从目录结构可以看到几类关键 hook：
+
+\paragraph{权限与工具控制}
+
+\texttt{useCanUseTool.tsx} 是工具权限检查的核心 hook。它实现了 \texttt{CanUseToolFn} 类型，在每次工具调用前判断是否允许执行。这个 hook 综合考虑权限模式、规则配置、用户交互历史等因素做出决策。
+
+\paragraph{用户交互}
+
+\texttt{useExitOnCtrlCD.ts} 处理 Ctrl+C/Ctrl+D 退出逻辑，\texttt{useArrowKeyHistory.tsx} 管理方向键历史导航，\texttt{useCopyOnSelect.ts} 实现选中复制功能，\texttt{useCommandKeybindings.tsx} 处理命令快捷键绑定。
+
+\paragraph{会话与状态}
+
+\texttt{useCommandQueue.ts} 管理命令队列，\texttt{useDynamicConfig.ts} 处理动态配置变更，\texttt{useAssistantHistory.ts} 管理助手对话历史。
+
+\paragraph{用户自定义 Hook}
+
+除了内置的 React hook，Claude Code 还支持用户通过 \texttt{settings.json} 配置的 shell hook。这些 hook 在特定事件（如 \texttt{PreToolUse}、\texttt{PostToolUse}、\texttt{Notification}）触发时执行用户指定的 shell 命令。用户自定义 hook 的执行结果可以影响工具调用的行为——例如 \texttt{PreToolUse} hook 可以阻止某个工具的执行。
+
+这两层 hook 机制的区别在于：React hook 是系统内部的状态管理机制，用户自定义 hook 是面向用户的扩展点。前者在组件渲染周期中运行，后者通过子进程执行 shell 命令。
+
+\section{执行流串联：从 API 响应到工具结果}
+
+将上述三个子系统串联起来，图 \ref{fig:tool-execution} 展示了一次完整的工具调用流程。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.9cm,
+  box/.style={rectangle, draw, rounded corners, minimum width=5cm, minimum height=0.7cm, align=center, font=\small},
+  decision/.style={diamond, draw, aspect=2.5, minimum width=3cm, align=center, font=\small},
+  arrow/.style={->, thick},
+]
+  \node[box] (api) {Claude API 返回 tool\_use block};
+  \node[box, below=of api] (find) {findToolByName() 查找工具};
+  \node[decision, below=of find] (perm) {CanUseToolFn\\权限检查};
+  \node[box, below left=1cm and 0.5cm of perm] (deny) {PermissionDenial\\通知 Claude};
+  \node[box, below right=1cm and 0.5cm of perm] (exec) {tool.call()\\执行工具};
+  \node[box, below=of exec] (result) {ToolResult 追加到消息历史};
+  \node[box, below=of result] (hook) {PostToolUse Hook（若配置）};
+  \node[box, below=of hook] (next) {下一轮 API 调用};
+
+  \draw[arrow] (api) -- (find);
+  \draw[arrow] (find) -- (perm);
+  \draw[arrow] (perm) -- node[left, font=\small] {拒绝} (deny);
+  \draw[arrow] (perm) -- node[right, font=\small] {允许} (exec);
+  \draw[arrow] (exec) -- (result);
+  \draw[arrow] (result) -- (hook);
+  \draw[arrow] (hook) -- (next);
+  \draw[arrow] (deny) |- (next);
+\end{tikzpicture}
+\caption{工具调用执行流程}
+\label{fig:tool-execution}
+\end{figure}
+
+具体步骤如下：
+
+\begin{enumerate}
+  \item Claude API 返回包含 \texttt{tool\_use} block 的响应
+  \item \texttt{query()} 解析 \texttt{tool\_use} block，通过 \texttt{findToolByName()} 查找对应工具
+  \item \texttt{CanUseToolFn}（来自 \texttt{useCanUseTool} hook）执行权限检查
+  \item 若权限通过，调用工具的执行函数，传入 \texttt{ToolUseContext}
+  \item 工具执行完成，返回 \texttt{ToolResult}
+  \item 结果被追加到消息历史，作为下一轮 API 调用的上下文
+  \item 若用户配置了 \texttt{PostToolUse} hook，执行对应的 shell 命令
+\end{enumerate}
+
+如果用户在步骤 3 拒绝了权限请求，系统生成一个 \texttt{PermissionDenial}，Claude 会收到拒绝信息并调整后续行为。
+
+这个流程的关键设计决策是：权限检查发生在工具执行之前，而不是之后。这意味着 Claude 提出的工具调用请求可以被用户拦截，系统不会执行任何未经授权的操作。这是 Claude Code 安全模型的基础，将在第 8 章深入分析。
