@@ -8,6 +8,10 @@
 
 仓库包含 LaTeX 源码、封面资源、章节内容以及可编译的 PDF 输出。
 
+<div align="center">
+  <img src="./assets/book_cover.png" alt="《深入浅出 Claude Code》封面" width="320" />
+</div>
+
 ## 目录结构
 
 - `main.tex`: 主控文件
